@@ -8,6 +8,7 @@ Then open http://localhost:7860
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,71 +17,102 @@ from pathlib import Path
 import gradio as gr
 
 
-def run_analysis(path: str, api_key: str, verbose: bool):
-    path = path.strip()
-    if not path:
-        yield "❌ Please enter a path to analyse.", ""
-        return
+def _clone_repo(github_url: str, dest: str) -> tuple[bool, str]:
+    """Shallow-clone a GitHub repo. Returns (success, message)."""
+    result = subprocess.run(
+        ["git", "clone", "--depth", "1", github_url, dest],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False, result.stderr.strip()
+    return True, ""
 
+
+def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
     api_key = api_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         yield "❌ Anthropic API key is required.", ""
         return
 
-    if not Path(path).exists():
-        yield f"❌ Path does not exist: {path}", ""
+    github_url = github_url.strip()
+    local_path = local_path.strip()
+
+    if not github_url and not local_path:
+        yield "❌ Provide a GitHub URL or a local path.", ""
         return
 
-    report_file = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w")
-    report_path = report_file.name
-    report_file.close()
-
-    cmd = [sys.executable, "-m", "qa_agent.cli", path, "--output", report_path]
-    if verbose:
-        cmd.append("--verbose")
-
-    env = os.environ.copy()
-    env["ANTHROPIC_API_KEY"] = api_key
-
-    log = ""
+    clone_dir = None
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-            cwd=str(Path(__file__).parent),
-        )
-        for line in process.stdout:
-            log += line
-            yield log, ""
+        if github_url:
+            clone_dir = tempfile.mkdtemp(prefix="qa_agent_clone_")
+            yield f"⬇️  Cloning {github_url} …\n", ""
+            ok, err = _clone_repo(github_url, clone_dir)
+            if not ok:
+                yield f"❌ Clone failed:\n{err}", ""
+                return
+            target = clone_dir
+            yield f"✅ Cloned to temporary directory.\n\n", ""
+        else:
+            target = local_path
+            if not Path(target).exists():
+                yield f"❌ Path does not exist: {target}", ""
+                return
 
-        process.wait()
+        report_file = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w")
+        report_path = report_file.name
+        report_file.close()
 
-        report = ""
-        if Path(report_path).exists():
-            report = Path(report_path).read_text(encoding="utf-8")
+        cmd = [sys.executable, "-m", "qa_agent.cli", target, "--output", report_path]
+        if verbose:
+            cmd.append("--verbose")
 
-        yield log, report
-    finally:
+        env = os.environ.copy()
+        env["ANTHROPIC_API_KEY"] = api_key
+
+        log = f"⬇️  Cloning {github_url} …\n✅ Cloned to temporary directory.\n\n" if github_url else ""
         try:
-            os.unlink(report_path)
-        except OSError:
-            pass
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                cwd=str(Path(__file__).parent),
+            )
+            for line in process.stdout:
+                log += line
+                yield log, ""
+
+            process.wait()
+
+            report = ""
+            if Path(report_path).exists():
+                report = Path(report_path).read_text(encoding="utf-8")
+
+            yield log, report
+        finally:
+            try:
+                os.unlink(report_path)
+            except OSError:
+                pass
+
+    finally:
+        if clone_dir:
+            shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 with gr.Blocks(title="Scalability QA Agent") as demo:
     gr.Markdown("# Production Scalability QA Agent")
     gr.Markdown(
-        "Analyses a codebase for scalability issues using Claude. "
-        "Point it at any local directory."
+        "Analyse any codebase for production scalability issues using Claude. "
+        "Paste a GitHub URL **or** a local folder path."
     )
 
     with gr.Row():
-        path_input = gr.Textbox(
-            label="Codebase path",
-            placeholder="/path/to/your/project",
+        github_input = gr.Textbox(
+            label="GitHub repo URL",
+            placeholder="https://github.com/owner/repo",
             scale=3,
         )
         api_key_input = gr.Textbox(
@@ -90,6 +122,11 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
             value=os.environ.get("ANTHROPIC_API_KEY", ""),
             scale=2,
         )
+
+    local_input = gr.Textbox(
+        label="— or — local path",
+        placeholder="/path/to/your/project  (leave blank if using GitHub URL above)",
+    )
 
     verbose_cb = gr.Checkbox(label="Verbose — show Claude's reasoning", value=False)
     run_btn = gr.Button("Analyse", variant="primary", size="lg")
@@ -107,7 +144,7 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
 
     run_btn.click(
         fn=run_analysis,
-        inputs=[path_input, api_key_input, verbose_cb],
+        inputs=[github_input, local_input, api_key_input, verbose_cb],
         outputs=[log_output, report_output],
     )
 
