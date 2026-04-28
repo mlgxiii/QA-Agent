@@ -236,7 +236,6 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
             label="Anthropic API key",
             placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
             type="password",
-            value=os.environ.get("ANTHROPIC_API_KEY", ""),
             scale=2,
         )
 
@@ -245,7 +244,6 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
             label="GitHub token (optional — required for private repos)",
             placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
             type="password",
-            value=os.environ.get("GITHUB_TOKEN", ""),
         )
 
     local_input = gr.Textbox(
