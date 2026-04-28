@@ -2,7 +2,6 @@
 Gradio web interface for the Production Scalability QA Agent.
 
 Usage:
-    pip install gradio
     python app.py
 Then open http://localhost:7860
 """
@@ -12,21 +11,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import gradio as gr
 
+import db
+
+db.init_db()
+
 
 def _clone_repo(github_url: str, dest: str) -> tuple[bool, str]:
-    """Shallow-clone a GitHub repo. Returns (success, message)."""
     result = subprocess.run(
         ["git", "clone", "--depth", "1", github_url, dest],
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
-        return False, result.stderr.strip()
-    return True, ""
+    return result.returncode == 0, result.stderr.strip()
 
 
 def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
@@ -46,18 +47,23 @@ def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
     try:
         if github_url:
             clone_dir = tempfile.mkdtemp(prefix="qa_agent_clone_")
-            yield f"⬇️  Cloning {github_url} …\n", ""
+            log = f"⬇️  Cloning {github_url} …\n"
+            yield log, ""
             ok, err = _clone_repo(github_url, clone_dir)
             if not ok:
-                yield f"❌ Clone failed:\n{err}", ""
+                yield log + f"❌ Clone failed:\n{err}", ""
                 return
             target = clone_dir
-            yield f"✅ Cloned to temporary directory.\n\n", ""
+            source = github_url
+            log += "✅ Cloned.\n\n"
+            yield log, ""
         else:
             target = local_path
+            source = local_path
             if not Path(target).exists():
                 yield f"❌ Path does not exist: {target}", ""
                 return
+            log = ""
 
         report_file = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w")
         report_path = report_file.name
@@ -70,7 +76,7 @@ def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
         env = os.environ.copy()
         env["ANTHROPIC_API_KEY"] = api_key
 
-        log = f"⬇️  Cloning {github_url} …\n✅ Cloned to temporary directory.\n\n" if github_url else ""
+        start = time.time()
         try:
             process = subprocess.Popen(
                 cmd,
@@ -85,10 +91,14 @@ def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
                 yield log, ""
 
             process.wait()
+            duration = time.time() - start
 
             report = ""
             if Path(report_path).exists():
                 report = Path(report_path).read_text(encoding="utf-8")
+
+            if report:
+                db.save_analysis(source, report, duration)
 
             yield log, report
         finally:
@@ -100,6 +110,31 @@ def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
     finally:
         if clone_dir:
             shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def load_history() -> list[list]:
+    rows = db.get_history()
+    if not rows:
+        return []
+    return [
+        [
+            r["id"],
+            r["source"],
+            r["timestamp"][:16].replace("T", " "),
+            f'{int(r["duration_s"])}s' if r["duration_s"] else "—",
+            r["critical"],
+            r["high"],
+            r["medium"],
+            r["low"],
+        ]
+        for r in rows
+    ]
+
+
+def load_report(analysis_id) -> str:
+    if not analysis_id:
+        return ""
+    return db.get_report(int(analysis_id))
 
 
 with gr.Blocks(title="Scalability QA Agent") as demo:
@@ -141,12 +176,27 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
             )
         with gr.Tab("Report"):
             report_output = gr.Markdown(label="Scalability report")
+        with gr.Tab("History"):
+            refresh_btn = gr.Button("Refresh", size="sm")
+            history_df = gr.Dataframe(
+                headers=["ID", "Source", "Date", "Duration", "Critical", "High", "Medium", "Low"],
+                interactive=False,
+                wrap=True,
+            )
+            gr.Markdown("### Load a past report")
+            with gr.Row():
+                id_input = gr.Number(label="Report ID", precision=0, scale=1)
+                load_btn = gr.Button("Load", scale=1)
+            past_report = gr.Markdown()
 
     run_btn.click(
         fn=run_analysis,
         inputs=[github_input, local_input, api_key_input, verbose_cb],
         outputs=[log_output, report_output],
     )
+    refresh_btn.click(fn=load_history, outputs=history_df)
+    load_btn.click(fn=load_report, inputs=id_input, outputs=past_report)
+    demo.load(fn=load_history, outputs=history_df)
 
 if __name__ == "__main__":
     demo.launch(theme=gr.themes.Soft())
