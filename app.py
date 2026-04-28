@@ -35,10 +35,17 @@ def _parse_github_url(url: str) -> tuple[str, str] | None:
 
 def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bool, str]:
     """Download repo as a ZIP via the GitHub API and extract it."""
-    headers = {"Authorization": f"token {token}"} if token else {}
+    # Use the GitHub API zipball endpoint — it respects the Authorization header
+    # and works for both public and private repos, unlike the /archive/ web URL.
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     last_err = ""
     for branch in ("main", "master"):
-        zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip"
+        zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{branch}"
         req = urllib.request.Request(zip_url, headers=headers)  # noqa: S310
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310
@@ -83,10 +90,19 @@ def _clone_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]
 
 def _fetch_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]:
     """Try git clone first; fall back to ZIP download for restricted envs (e.g. HF Spaces)."""
-    ok, err = _clone_repo(github_url, dest, token)
-    if ok:
-        return True, ""
     parsed = _parse_github_url(github_url)
+
+    # HuggingFace Spaces blocks outbound git operations via a credential interceptor,
+    # so skip straight to ZIP download when running there.
+    in_hf_spaces = bool(os.environ.get("SPACE_ID"))
+
+    if not in_hf_spaces:
+        ok, err = _clone_repo(github_url, dest, token)
+        if ok:
+            return True, ""
+    else:
+        err = "git clone skipped (HuggingFace Spaces environment)"
+
     if parsed:
         ok2, err2 = _download_zip(*parsed, dest, token)
         if ok2:
