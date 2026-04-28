@@ -33,26 +33,26 @@ def _parse_github_url(url: str) -> tuple[str, str] | None:
     return m.group(1), m.group(2).removesuffix(".git")
 
 
-def _download_zip(owner: str, repo: str, dest: str) -> tuple[bool, str]:
-    """Download repo as a ZIP via the GitHub anonymous API and extract it."""
-    zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
-    try:
-        with urllib.request.urlopen(zip_url, timeout=60) as resp:  # noqa: S310
-            data = resp.read()
-    except Exception:
-        # Try 'master' if 'main' fails
-        zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip"
+def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bool, str]:
+    """Download repo as a ZIP via the GitHub API and extract it."""
+    headers = {"Authorization": f"token {token}"} if token else {}
+    last_err = ""
+    for branch in ("main", "master"):
+        zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip"
+        req = urllib.request.Request(zip_url, headers=headers)  # noqa: S310
         try:
-            with urllib.request.urlopen(zip_url, timeout=60) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310
                 data = resp.read()
+            break
         except Exception as exc:
-            return False, str(exc)
+            last_err = str(exc)
+    else:
+        return False, last_err
 
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             top = zf.namelist()[0].split("/")[0]
             zf.extractall(dest)
-        # Move contents out of the top-level folder GitHub adds
         inner = Path(dest) / top
         for item in inner.iterdir():
             shutil.move(str(item), dest)
@@ -63,10 +63,15 @@ def _download_zip(owner: str, repo: str, dest: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _clone_repo(github_url: str, dest: str) -> tuple[bool, str]:
+def _clone_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]:
     env = os.environ.copy()
     # Prevent git from hanging trying to prompt for credentials in a headless env
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if token:
+        parsed = _parse_github_url(github_url)
+        if parsed:
+            owner, repo = parsed
+            github_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
     result = subprocess.run(
         ["git", "clone", "--depth", "1", github_url, dest],
         capture_output=True,
@@ -76,22 +81,23 @@ def _clone_repo(github_url: str, dest: str) -> tuple[bool, str]:
     return result.returncode == 0, result.stderr.strip()
 
 
-def _fetch_repo(github_url: str, dest: str) -> tuple[bool, str]:
+def _fetch_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]:
     """Try git clone first; fall back to ZIP download for restricted envs (e.g. HF Spaces)."""
-    ok, err = _clone_repo(github_url, dest)
+    ok, err = _clone_repo(github_url, dest, token)
     if ok:
         return True, ""
     parsed = _parse_github_url(github_url)
     if parsed:
-        ok2, err2 = _download_zip(*parsed, dest)
+        ok2, err2 = _download_zip(*parsed, dest, token)
         if ok2:
             return True, ""
         return False, f"git clone failed: {err}\nZIP download also failed: {err2}"
     return False, err
 
 
-def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
+def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, verbose: bool):
     api_key = api_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+    gh_token = gh_token.strip() or os.environ.get("GITHUB_TOKEN", "")
     if not api_key:
         yield "❌ Anthropic API key is required.", ""
         return
@@ -109,7 +115,7 @@ def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
             clone_dir = tempfile.mkdtemp(prefix="qa_agent_clone_")
             log = f"⬇️  Fetching {github_url} …\n"
             yield log, ""
-            ok, err = _fetch_repo(github_url, clone_dir)
+            ok, err = _fetch_repo(github_url, clone_dir, gh_token)
             if not ok:
                 yield log + f"❌ Clone failed:\n{err}", ""
                 return
@@ -218,6 +224,14 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
             scale=2,
         )
 
+    with gr.Row():
+        gh_token_input = gr.Textbox(
+            label="GitHub token (optional — required for private repos)",
+            placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
+            type="password",
+            value=os.environ.get("GITHUB_TOKEN", ""),
+        )
+
     local_input = gr.Textbox(
         label="— or — local path",
         placeholder="/path/to/your/project  (leave blank if using GitHub URL above)",
@@ -251,7 +265,7 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
 
     run_btn.click(
         fn=run_analysis,
-        inputs=[github_input, local_input, api_key_input, verbose_cb],
+        inputs=[github_input, local_input, api_key_input, gh_token_input, verbose_cb],
         outputs=[log_output, report_output],
     )
     refresh_btn.click(fn=load_history, outputs=history_df)
