@@ -6,12 +6,16 @@ Usage:
 Then open http://localhost:7860
 """
 
+import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
+import zipfile
 from pathlib import Path
 
 import gradio as gr
@@ -19,6 +23,44 @@ import gradio as gr
 import db
 
 db.init_db()
+
+
+def _parse_github_url(url: str) -> tuple[str, str] | None:
+    """Return (owner, repo) from a github.com URL, or None if not parseable."""
+    m = re.match(r"https?://github\.com/([^/]+)/([^/?.#]+)", url)
+    if not m:
+        return None
+    return m.group(1), m.group(2).removesuffix(".git")
+
+
+def _download_zip(owner: str, repo: str, dest: str) -> tuple[bool, str]:
+    """Download repo as a ZIP via the GitHub anonymous API and extract it."""
+    zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
+    try:
+        with urllib.request.urlopen(zip_url, timeout=60) as resp:  # noqa: S310
+            data = resp.read()
+    except Exception:
+        # Try 'master' if 'main' fails
+        zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip"
+        try:
+            with urllib.request.urlopen(zip_url, timeout=60) as resp:  # noqa: S310
+                data = resp.read()
+        except Exception as exc:
+            return False, str(exc)
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            top = zf.namelist()[0].split("/")[0]
+            zf.extractall(dest)
+        # Move contents out of the top-level folder GitHub adds
+        inner = Path(dest) / top
+        for item in inner.iterdir():
+            shutil.move(str(item), dest)
+        inner.rmdir()
+    except Exception as exc:
+        return False, str(exc)
+
+    return True, ""
 
 
 def _clone_repo(github_url: str, dest: str) -> tuple[bool, str]:
@@ -32,6 +74,20 @@ def _clone_repo(github_url: str, dest: str) -> tuple[bool, str]:
         env=env,
     )
     return result.returncode == 0, result.stderr.strip()
+
+
+def _fetch_repo(github_url: str, dest: str) -> tuple[bool, str]:
+    """Try git clone first; fall back to ZIP download for restricted envs (e.g. HF Spaces)."""
+    ok, err = _clone_repo(github_url, dest)
+    if ok:
+        return True, ""
+    parsed = _parse_github_url(github_url)
+    if parsed:
+        ok2, err2 = _download_zip(*parsed, dest)
+        if ok2:
+            return True, ""
+        return False, f"git clone failed: {err}\nZIP download also failed: {err2}"
+    return False, err
 
 
 def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
@@ -51,15 +107,15 @@ def run_analysis(github_url: str, local_path: str, api_key: str, verbose: bool):
     try:
         if github_url:
             clone_dir = tempfile.mkdtemp(prefix="qa_agent_clone_")
-            log = f"⬇️  Cloning {github_url} …\n"
+            log = f"⬇️  Fetching {github_url} …\n"
             yield log, ""
-            ok, err = _clone_repo(github_url, clone_dir)
+            ok, err = _fetch_repo(github_url, clone_dir)
             if not ok:
                 yield log + f"❌ Clone failed:\n{err}", ""
                 return
             target = clone_dir
             source = github_url
-            log += "✅ Cloned.\n\n"
+            log += "✅ Fetched.\n\n"
             yield log, ""
         else:
             target = local_path
