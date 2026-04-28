@@ -12,6 +12,7 @@ def init_db() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS analyses (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT    NOT NULL DEFAULT '',
                 source     TEXT    NOT NULL,
                 timestamp  TEXT    NOT NULL,
                 duration_s REAL,
@@ -22,16 +23,25 @@ def init_db() -> None:
                 low        INTEGER DEFAULT 0
             )
         """)
+        # Migrate existing databases that predate the session_id column
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(analyses)")}
+        if "session_id" not in cols:
+            conn.execute(
+                "ALTER TABLE analyses ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+            )
 
 
-def save_analysis(source: str, report_md: str, duration_s: float) -> int:
+def save_analysis(
+    source: str, report_md: str, duration_s: float, session_id: str = ""
+) -> int:
     counts = _count_severity(report_md)
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO analyses "
-            "(source, timestamp, duration_s, report_md, critical, high, medium, low) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "(session_id, source, timestamp, duration_s, report_md, critical, high, medium, low) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (
+                session_id,
                 source,
                 datetime.utcnow().isoformat(timespec="seconds"),
                 round(duration_s),
@@ -45,19 +55,21 @@ def save_analysis(source: str, report_md: str, duration_s: float) -> int:
         return cur.lastrowid
 
 
-def get_history() -> list[dict]:
+def get_history(session_id: str = "") -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
             "SELECT id, source, timestamp, duration_s, critical, high, medium, low "
-            "FROM analyses ORDER BY timestamp DESC LIMIT 100"
+            "FROM analyses WHERE session_id = ? ORDER BY timestamp DESC LIMIT 100",
+            (session_id,),
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-def get_report(analysis_id: int) -> str:
+def get_report(analysis_id: int, session_id: str = "") -> str:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT report_md FROM analyses WHERE id = ?", (analysis_id,)
+            "SELECT report_md FROM analyses WHERE id = ? AND session_id = ?",
+            (analysis_id, session_id),
         ).fetchone()
     return row["report_md"] if row else "Report not found."
 

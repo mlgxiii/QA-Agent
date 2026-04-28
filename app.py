@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -111,7 +112,7 @@ def _fetch_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]
     return False, err
 
 
-def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, verbose: bool):
+def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, verbose: bool, session_id: str = ""):
     api_key = api_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
     gh_token = gh_token.strip() or os.environ.get("GITHUB_TOKEN", "")
     if not api_key:
@@ -180,7 +181,7 @@ def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, 
                 report = Path(report_path).read_text(encoding="utf-8")
 
             if report:
-                db.save_analysis(source, report, duration)
+                db.save_analysis(source, report, duration, session_id)
 
             yield log, report
         finally:
@@ -194,8 +195,8 @@ def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, 
             shutil.rmtree(clone_dir, ignore_errors=True)
 
 
-def load_history() -> list[list]:
-    rows = db.get_history()
+def load_history(session_id: str = "") -> list[list]:
+    rows = db.get_history(session_id)
     if not rows:
         return []
     return [
@@ -213,13 +214,14 @@ def load_history() -> list[list]:
     ]
 
 
-def load_report(analysis_id) -> str:
+def load_report(analysis_id, session_id: str = "") -> str:
     if not analysis_id:
         return ""
-    return db.get_report(int(analysis_id))
+    return db.get_report(int(analysis_id), session_id)
 
 
 with gr.Blocks(title="Scalability QA Agent") as demo:
+    session_state = gr.State(lambda: str(uuid.uuid4()))
     gr.Markdown("# Production Scalability QA Agent")
     gr.Markdown(
         "Analyse any codebase for production scalability issues using Claude. "
@@ -279,12 +281,12 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
 
     run_btn.click(
         fn=run_analysis,
-        inputs=[github_input, local_input, api_key_input, gh_token_input, verbose_cb],
+        inputs=[github_input, local_input, api_key_input, gh_token_input, verbose_cb, session_state],
         outputs=[log_output, report_output],
     )
-    refresh_btn.click(fn=load_history, outputs=history_df)
-    load_btn.click(fn=load_report, inputs=id_input, outputs=past_report)
-    demo.load(fn=load_history, outputs=history_df)
+    refresh_btn.click(fn=load_history, inputs=session_state, outputs=history_df)
+    load_btn.click(fn=load_report, inputs=[id_input, session_state], outputs=past_report)
+    demo.load(fn=load_history, inputs=session_state, outputs=history_df)
 
 if __name__ == "__main__":
     demo.launch(theme=gr.themes.Soft())
