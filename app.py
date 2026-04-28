@@ -22,10 +22,14 @@ db.init_db()
 
 
 def _clone_repo(github_url: str, dest: str) -> tuple[bool, str]:
+    env = os.environ.copy()
+    # Prevent git from hanging trying to prompt for credentials in a headless env
+    env["GIT_TERMINAL_PROMPT"] = "0"
     result = subprocess.run(
         ["git", "clone", "--depth", "1", github_url, dest],
         capture_output=True,
         text=True,
+        env=env,
     )
     return result.returncode == 0, result.stderr.strip()
 
