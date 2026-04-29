@@ -311,7 +311,7 @@ def load_report(analysis_id, session_id: str = "") -> str:
 
 
 with gr.Blocks(title="Scalability QA Agent") as demo:
-    session_state = gr.State(lambda: str(uuid.uuid4()))
+    session_state = gr.State(value="")
     gr.Markdown("# Production Scalability QA Agent")
     gr.Markdown(
         "Analyse any codebase for production scalability issues using Claude or GPT-4o. "
@@ -400,9 +400,13 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
         ],
         outputs=[log_output, report_output],
     )
+    def _on_load() -> tuple[str, list]:
+        sid = str(uuid.uuid4())
+        return sid, load_history(sid)
+
     refresh_btn.click(fn=load_history, inputs=session_state, outputs=history_df)
     load_btn.click(fn=load_report, inputs=[id_input, session_state], outputs=past_report)
-    demo.load(fn=load_history, inputs=session_state, outputs=history_df)
+    demo.load(fn=_on_load, inputs=None, outputs=[session_state, history_df])
 
 if __name__ == "__main__":
     demo.launch(theme=gr.themes.Soft())
