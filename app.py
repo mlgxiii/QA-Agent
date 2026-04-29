@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import urllib.request
 import uuid
 import zipfile
@@ -34,22 +35,36 @@ def _parse_github_url(url: str) -> tuple[str, str] | None:
     return m.group(1), m.group(2).removesuffix(".git")
 
 
+class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strip the Authorization header before following cross-origin redirects.
+
+    GitHub API returns 302 → codeload.github.com. Forwarding the Bearer token
+    to that domain causes auth errors and can crash the download silently.
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None:
+            new_req.remove_header("Authorization")
+        return new_req
+
+
 def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bool, str]:
     """Download repo as a ZIP via the GitHub API and extract it."""
-    # Use the GitHub API zipball endpoint — it respects the Authorization header
-    # and works for both public and private repos, unlike the /archive/ web URL.
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+
+    opener = urllib.request.build_opener(_NoAuthRedirectHandler)
+
     last_err = ""
     for branch in ("main", "master"):
         zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{branch}"
         req = urllib.request.Request(zip_url, headers=headers)  # noqa: S310
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310
+            with opener.open(req, timeout=60) as resp:
                 data = resp.read()
             break
         except Exception as exc:
@@ -62,9 +77,10 @@ def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bo
             top = zf.namelist()[0].split("/")[0]
             zf.extractall(dest)
         inner = Path(dest) / top
-        for item in inner.iterdir():
-            shutil.move(str(item), dest)
-        inner.rmdir()
+        if inner.exists():
+            for item in inner.iterdir():
+                shutil.move(str(item), dest)
+            shutil.rmtree(str(inner), ignore_errors=True)
     except Exception as exc:
         return False, str(exc)
 
@@ -112,7 +128,20 @@ def _fetch_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]
     return False, err
 
 
+_MAX_LOG_LINES = 500   # keep tail of log to avoid unbounded memory growth on HF Spaces
+_ANALYSIS_TIMEOUT = 600  # 10-minute hard cap on the subprocess
+
+
+def _tail_log(log: str, max_lines: int = _MAX_LOG_LINES) -> str:
+    lines = log.splitlines(keepends=True)
+    if len(lines) > max_lines:
+        dropped = len(lines) - max_lines
+        return f"[… {dropped} earlier lines dropped …]\n" + "".join(lines[-max_lines:])
+    return log
+
+
 def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, verbose: bool, session_id: str = ""):
+    session_id = session_id or ""
     api_key = api_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
     gh_token = gh_token.strip() or os.environ.get("GITHUB_TOKEN", "")
     if not api_key:
@@ -160,6 +189,7 @@ def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, 
         env["ANTHROPIC_API_KEY"] = api_key
 
         start = time.time()
+        timed_out = False
         try:
             process = subprocess.Popen(
                 cmd,
@@ -169,12 +199,32 @@ def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, 
                 env=env,
                 cwd=str(Path(__file__).parent),
             )
+
+            # Enforce a hard timeout so a hung Anthropic API call can't stall HF Spaces forever.
+            def _kill_on_timeout():
+                nonlocal timed_out
+                try:
+                    process.wait(timeout=_ANALYSIS_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    process.kill()
+
+            watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+            watchdog.start()
+
             for line in process.stdout:
                 log += line
+                log = _tail_log(log)
                 yield log, ""
 
             process.wait()
+            watchdog.join(timeout=1)
             duration = time.time() - start
+
+            if timed_out:
+                log += f"\n⏱️  Analysis timed out after {_ANALYSIS_TIMEOUT // 60} minutes.\n"
+                yield log, ""
+                return
 
             report = ""
             if Path(report_path).exists():
@@ -196,7 +246,7 @@ def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, 
 
 
 def load_history(session_id: str = "") -> list[list]:
-    rows = db.get_history(session_id)
+    rows = db.get_history(session_id or "")
     if not rows:
         return []
     return [
@@ -217,7 +267,7 @@ def load_history(session_id: str = "") -> list[list]:
 def load_report(analysis_id, session_id: str = "") -> str:
     if not analysis_id:
         return ""
-    return db.get_report(int(analysis_id), session_id)
+    return db.get_report(int(analysis_id), session_id or "")
 
 
 with gr.Blocks(title="Scalability QA Agent") as demo:
