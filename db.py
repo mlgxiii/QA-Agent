@@ -4,7 +4,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(os.environ.get("DATA_DIR", Path(__file__).parent)) / "history.db"
+_default_db_dir = "/tmp" if os.environ.get("SPACE_ID") else str(Path(__file__).parent)
+DB_PATH = Path(os.environ.get("DATA_DIR", _default_db_dir)) / "history.db"
 
 
 def init_db() -> None:
