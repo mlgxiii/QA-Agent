@@ -71,7 +71,7 @@ def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bo
     opener = urllib.request.build_opener(_NoAuthRedirectHandler)
 
     last_err = ""
-    for branch in ("main", "master"):
+    for branch in ("main", "master", "HEAD"):
         zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{branch}"
         req = urllib.request.Request(zip_url, headers=headers)  # noqa: S310
         try:
@@ -225,8 +225,8 @@ def run_analysis(
             cmd.append("--verbose")
 
         env = os.environ.copy()
-        env["ANTHROPIC_API_KEY"] = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
-        env["OPENAI_API_KEY"] = openai_key.strip() or os.environ.get("OPENAI_API_KEY", "")
+        env["ANTHROPIC_API_KEY"] = (anthropic_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+        env["OPENAI_API_KEY"] = (openai_key or "").strip() or os.environ.get("OPENAI_API_KEY", "")
 
         start = time.time()
         timed_out = False
