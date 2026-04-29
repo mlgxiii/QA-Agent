@@ -3,8 +3,6 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from openai import OpenAI
-
 from .prompts import SYSTEM_PROMPT
 from .tools import TOOL_DEFINITIONS, execute_tool
 
@@ -41,6 +39,13 @@ class OpenAIQAAgent:
     DEFAULT_MODEL = "gpt-4o"
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError(
+                "openai package is required for OpenAI models. "
+                "Run: pip install openai>=1.30.0"
+            )
         self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
         self.model = model or self.DEFAULT_MODEL
         self._tools = _to_openai_tools(TOOL_DEFINITIONS)

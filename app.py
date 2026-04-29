@@ -24,7 +24,11 @@ import gradio as gr
 
 import db
 from qa_agent.agent import ANTHROPIC_MODELS
-from qa_agent.agent_openai import OPENAI_MODELS
+
+try:
+    from qa_agent.agent_openai import OPENAI_MODELS
+except ImportError:
+    OPENAI_MODELS = set()
 
 db.init_db()
 
