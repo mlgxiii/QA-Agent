@@ -9,21 +9,28 @@ from .prompts import SYSTEM_PROMPT
 from .tools import TOOL_DEFINITIONS, execute_tool
 
 
+ANTHROPIC_MODELS = {
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+}
+
+
 class ScalabilityQAAgent:
     """
-    Production Scalability QA Agent.
+    Production Scalability QA Agent (Anthropic).
 
-    Uses Claude claude-opus-4-7 with adaptive thinking, streaming output, and prompt
-    caching on the system prompt to efficiently analyse codebases for
-    scalability issues.
+    Uses extended thinking, streaming output, and prompt caching on the system
+    prompt to efficiently analyse codebases for scalability issues.
     """
 
-    MODEL = "claude-opus-4-7"
+    DEFAULT_MODEL = "claude-opus-4-7"
 
-    def __init__(self, api_key: Optional[str] = None) -> None:
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         self.client = anthropic.Anthropic(
             api_key=api_key or os.environ.get("ANTHROPIC_API_KEY")
         )
+        self.MODEL = model or self.DEFAULT_MODEL
 
     # ------------------------------------------------------------------
     # Public API
@@ -51,7 +58,7 @@ class ScalabilityQAAgent:
         user_message = self._build_user_message(target, output_report)
         messages: list[dict] = [{"role": "user", "content": user_message}]
 
-        print(f"\n🔍  Analysing: {target}")
+        print(f"\n🔍  Analysing: {target}  [{self.MODEL}]")
         print("=" * 70)
 
         iteration = 0

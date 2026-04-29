@@ -23,8 +23,15 @@ from pathlib import Path
 import gradio as gr
 
 import db
+from qa_agent.agent import ANTHROPIC_MODELS
+from qa_agent.agent_openai import OPENAI_MODELS
 
 db.init_db()
+
+_ANTHROPIC_MODELS = sorted(ANTHROPIC_MODELS)
+_OPENAI_MODELS = sorted(OPENAI_MODELS)
+_ALL_MODELS = _ANTHROPIC_MODELS + _OPENAI_MODELS
+_DEFAULT_MODEL = "claude-opus-4-7"
 
 
 def _parse_github_url(url: str) -> tuple[str, str] | None:
@@ -140,13 +147,36 @@ def _tail_log(log: str, max_lines: int = _MAX_LOG_LINES) -> str:
     return log
 
 
-def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, verbose: bool, session_id: str = ""):
+def _update_key_visibility(model: str):
+    """Show/hide API key fields based on the selected provider."""
+    is_openai = model in OPENAI_MODELS
+    return gr.update(visible=not is_openai), gr.update(visible=is_openai)
+
+
+def run_analysis(
+    github_url: str,
+    local_path: str,
+    model: str,
+    anthropic_key: str,
+    openai_key: str,
+    gh_token: str,
+    verbose: bool,
+    session_id: str = "",
+):
     session_id = session_id or ""
-    api_key = api_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
     gh_token = gh_token.strip() or os.environ.get("GITHUB_TOKEN", "")
-    if not api_key:
-        yield "❌ Anthropic API key is required.", ""
-        return
+
+    # Pick the right API key based on provider
+    if model in OPENAI_MODELS:
+        api_key = openai_key.strip() or os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            yield "❌ OpenAI API key is required for this model.", ""
+            return
+    else:
+        api_key = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            yield "❌ Anthropic API key is required for this model.", ""
+            return
 
     github_url = github_url.strip()
     local_path = local_path.strip()
@@ -181,12 +211,18 @@ def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, 
         report_path = report_file.name
         report_file.close()
 
-        cmd = [sys.executable, "-m", "qa_agent.cli", target, "--output", report_path]
+        cmd = [
+            sys.executable, "-m", "qa_agent.cli",
+            target,
+            "--output", report_path,
+            "--model", model,
+        ]
         if verbose:
             cmd.append("--verbose")
 
         env = os.environ.copy()
-        env["ANTHROPIC_API_KEY"] = api_key
+        env["ANTHROPIC_API_KEY"] = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+        env["OPENAI_API_KEY"] = openai_key.strip() or os.environ.get("OPENAI_API_KEY", "")
 
         start = time.time()
         timed_out = False
@@ -200,7 +236,7 @@ def run_analysis(github_url: str, local_path: str, api_key: str, gh_token: str, 
                 cwd=str(Path(__file__).parent),
             )
 
-            # Enforce a hard timeout so a hung Anthropic API call can't stall HF Spaces forever.
+            # Enforce a hard timeout so a hung API call can't stall HF Spaces forever.
             def _kill_on_timeout():
                 nonlocal timed_out
                 try:
@@ -274,7 +310,7 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
     session_state = gr.State(lambda: str(uuid.uuid4()))
     gr.Markdown("# Production Scalability QA Agent")
     gr.Markdown(
-        "Analyse any codebase for production scalability issues using Claude. "
+        "Analyse any codebase for production scalability issues using Claude or GPT-4o. "
         "Paste a GitHub URL **or** a local folder path."
     )
 
@@ -284,18 +320,33 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
             placeholder="https://github.com/owner/repo",
             scale=3,
         )
+        model_dropdown = gr.Dropdown(
+            label="Model",
+            choices=_ALL_MODELS,
+            value=_DEFAULT_MODEL,
+            scale=2,
+        )
+
+    with gr.Row():
         api_key_input = gr.Textbox(
             label="Anthropic API key",
             placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
             type="password",
             scale=2,
+            visible=True,
         )
-
-    with gr.Row():
+        openai_key_input = gr.Textbox(
+            label="OpenAI API key",
+            placeholder="sk-…  (or set OPENAI_API_KEY env var)",
+            type="password",
+            scale=2,
+            visible=False,
+        )
         gh_token_input = gr.Textbox(
             label="GitHub token (optional — required for private repos)",
             placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
             type="password",
+            scale=2,
         )
 
     local_input = gr.Textbox(
@@ -303,7 +354,7 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
         placeholder="/path/to/your/project  (leave blank if using GitHub URL above)",
     )
 
-    verbose_cb = gr.Checkbox(label="Verbose — show Claude's reasoning", value=False)
+    verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
     run_btn = gr.Button("Analyse", variant="primary", size="lg")
 
     with gr.Tabs():
@@ -329,9 +380,20 @@ with gr.Blocks(title="Scalability QA Agent") as demo:
                 load_btn = gr.Button("Load", scale=1)
             past_report = gr.Markdown()
 
+    # Swap key field visibility when the model changes
+    model_dropdown.change(
+        fn=_update_key_visibility,
+        inputs=model_dropdown,
+        outputs=[api_key_input, openai_key_input],
+    )
+
     run_btn.click(
         fn=run_analysis,
-        inputs=[github_input, local_input, api_key_input, gh_token_input, verbose_cb, session_state],
+        inputs=[
+            github_input, local_input, model_dropdown,
+            api_key_input, openai_key_input,
+            gh_token_input, verbose_cb, session_state,
+        ],
         outputs=[log_output, report_output],
     )
     refresh_btn.click(fn=load_history, inputs=session_state, outputs=history_df)
