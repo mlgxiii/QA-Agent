@@ -170,16 +170,17 @@ def run_analysis(
     session_id = session_id or ""
     gh_token = gh_token.strip() or os.environ.get("GITHUB_TOKEN", "")
 
-    # Pick the right API key based on provider
+    # Pick the right API key based on provider — only accept keys typed in the UI,
+    # never fall back to Space secrets so users must supply their own key.
     if model in OPENAI_MODELS:
-        api_key = openai_key.strip() or os.environ.get("OPENAI_API_KEY", "")
+        api_key = (openai_key or "").strip()
         if not api_key:
             yield "❌ OpenAI API key is required for this model.", ""
             return
     else:
-        api_key = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = (anthropic_key or "").strip()
         if not api_key:
-            yield "❌ Anthropic API key is required for this model.", ""
+            yield "❌ Anthropic API key is required. Enter your key in the field above.", ""
             return
 
     github_url = github_url.strip()
@@ -225,8 +226,8 @@ def run_analysis(
             cmd.append("--verbose")
 
         env = os.environ.copy()
-        env["ANTHROPIC_API_KEY"] = (anthropic_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "")
-        env["OPENAI_API_KEY"] = (openai_key or "").strip() or os.environ.get("OPENAI_API_KEY", "")
+        env["ANTHROPIC_API_KEY"] = (anthropic_key or "").strip()
+        env["OPENAI_API_KEY"] = (openai_key or "").strip()
 
         start = time.time()
         timed_out = False
