@@ -225,8 +225,8 @@ def run_analysis(
             cmd.append("--verbose")
 
         env = os.environ.copy()
-        env["ANTHROPIC_API_KEY"] = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
-        env["OPENAI_API_KEY"] = openai_key.strip() or os.environ.get("OPENAI_API_KEY", "")
+        env["ANTHROPIC_API_KEY"] = (anthropic_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+        env["OPENAI_API_KEY"] = (openai_key or "").strip() or os.environ.get("OPENAI_API_KEY", "")
 
         start = time.time()
         timed_out = False
