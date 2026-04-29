@@ -131,9 +131,8 @@ Prioritise code that runs on every request. Be specific — cite exact line numb
 
         with self.client.messages.stream(
             model=self.MODEL,
-            max_tokens=64000,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
+            max_tokens=16000,
+            thinking={"type": "enabled", "budget_tokens": 10000},
             system=[
                 {
                     "type": "text",
