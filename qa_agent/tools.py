@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-MAX_FILE_SIZE_BYTES = 150 * 1024   # 150 KB per file before truncation
+MAX_FILE_SIZE_BYTES = 30 * 1024    # 30 KB per read before truncation
 MAX_LIST_ITEMS = 300               # max items returned by list_directory / find_files
 MAX_SEARCH_MATCHES = 25            # max matches returned by search_in_file
 
@@ -21,8 +21,8 @@ TOOL_DEFINITIONS: list[dict] = [
         "name": "read_file",
         "description": (
             "Read the source code of a file. Returns the file contents with line numbers. "
-            "Files larger than 150 KB are truncated. Use this to examine specific files "
-            "in detail for scalability issues."
+            "Each read is capped at 30 KB — for large files use start_line/end_line to read "
+            "specific sections. Use search_in_file to locate relevant line numbers first."
         ),
         "input_schema": {
             "type": "object",
@@ -30,7 +30,15 @@ TOOL_DEFINITIONS: list[dict] = [
                 "path": {
                     "type": "string",
                     "description": "Path to the file (relative to the analysis root or absolute).",
-                }
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-based line number to start reading from (default: 1).",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "1-based line number to stop reading at, inclusive (default: end of file).",
+                },
             },
             "required": ["path"],
         },
@@ -155,7 +163,12 @@ def execute_tool(name: str, inputs: dict[str, Any], root_path: str) -> str:
     try:
         match name:
             case "read_file":
-                return _read_file(inputs["path"], root_path)
+                return _read_file(
+                    inputs["path"],
+                    root_path,
+                    start_line=inputs.get("start_line"),
+                    end_line=inputs.get("end_line"),
+                )
             case "list_directory":
                 return _list_directory(
                     inputs["path"],
@@ -207,7 +220,7 @@ def _should_skip_dir(name: str) -> bool:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-def _read_file(path: str, root: str) -> str:
+def _read_file(path: str, root: str, start_line: int | None = None, end_line: int | None = None) -> str:
     target = _resolve(path, root)
 
     if not target.exists():
@@ -221,20 +234,31 @@ def _read_file(path: str, root: str) -> str:
     except Exception as exc:
         return f"Error reading file: {exc}"
 
-    lines = text.splitlines()
-    numbered = "\n".join(f"{i + 1:5d} | {line}" for i, line in enumerate(lines))
+    all_lines = text.splitlines()
+    total_lines = len(all_lines)
 
-    if raw_size > MAX_FILE_SIZE_BYTES:
-        truncated = numbered[: MAX_FILE_SIZE_BYTES]
-        shown_lines = truncated.count("\n")
+    # Apply line range selection
+    lo = max(1, start_line or 1)
+    hi = min(total_lines, end_line or total_lines)
+    lines = all_lines[lo - 1 : hi]
+
+    numbered = "\n".join(f"{lo + i:5d} | {line}" for i, line in enumerate(lines))
+
+    range_note = ""
+    if start_line or end_line:
+        range_note = f"  lines {lo}–{hi} of {total_lines}"
+
+    if len(numbered.encode()) > MAX_FILE_SIZE_BYTES:
+        truncated = numbered.encode()[:MAX_FILE_SIZE_BYTES].decode(errors="replace")
+        shown = truncated.count("\n") + 1
         return (
-            f"[File: {path}  ({raw_size:,} bytes, {len(lines)} lines) — "
-            f"showing first ~{shown_lines} lines]\n\n"
+            f"[File: {path}  ({raw_size:,} bytes, {total_lines} lines){range_note} — "
+            f"showing first ~{shown} lines of selection]\n\n"
             f"{truncated}\n\n"
-            f"[... TRUNCATED — file has {len(lines)} lines total ...]"
+            f"[... TRUNCATED — use start_line/end_line to read other sections ...]"
         )
 
-    return f"[File: {path}  ({raw_size:,} bytes, {len(lines)} lines)]\n\n{numbered}"
+    return f"[File: {path}  ({raw_size:,} bytes, {total_lines} lines){range_note}]\n\n{numbered}"
 
 
 def _list_directory(
