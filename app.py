@@ -71,7 +71,7 @@ def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bo
     opener = urllib.request.build_opener(_NoAuthRedirectHandler)
 
     last_err = ""
-    for branch in ("main", "master"):
+    for branch in ("main", "master", "HEAD"):
         zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{branch}"
         req = urllib.request.Request(zip_url, headers=headers)  # noqa: S310
         try:
