@@ -1,10 +1,14 @@
 """
-Gradio web interface for the Production Scalability QA Agent.
+Gradio web interface — two agents in one Space:
+  1. Production Scalability QA Agent
+  2. Website Design Analyzer Agent
 
 Usage:
     python app.py
 Then open http://localhost:7860
 """
+
+from __future__ import annotations
 
 import io
 import os
@@ -23,7 +27,8 @@ from pathlib import Path
 import gradio as gr
 
 import db
-from qa_agent.agent import ANTHROPIC_MODELS
+from qa_agent.agent import ANTHROPIC_MODELS as QA_ANTHROPIC_MODELS
+from design_agent.agent import ANTHROPIC_MODELS as DESIGN_ANTHROPIC_MODELS
 
 try:
     from qa_agent.agent_openai import OPENAI_MODELS
@@ -32,14 +37,17 @@ except ImportError:
 
 db.init_db()
 
-_ANTHROPIC_MODELS = sorted(ANTHROPIC_MODELS)
+_QA_MODELS = sorted(QA_ANTHROPIC_MODELS)
 _OPENAI_MODELS = sorted(OPENAI_MODELS)
-_ALL_MODELS = _ANTHROPIC_MODELS + _OPENAI_MODELS
+_QA_ALL_MODELS = _QA_MODELS + _OPENAI_MODELS
+_DESIGN_MODELS = sorted(DESIGN_ANTHROPIC_MODELS)
 _DEFAULT_MODEL = "claude-opus-4-7"
 
+# ============================================================================ #
+#  Shared GitHub fetch helpers (used by both agents)                           #
+# ============================================================================ #
 
 def _parse_github_url(url: str) -> tuple[str, str] | None:
-    """Return (owner, repo) from a github.com URL, or None if not parseable."""
     m = re.match(r"https?://github\.com/([^/]+)/([^/?.#]+)", url)
     if not m:
         return None
@@ -47,11 +55,6 @@ def _parse_github_url(url: str) -> tuple[str, str] | None:
 
 
 class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Strip the Authorization header before following cross-origin redirects.
-
-    GitHub API returns 302 → codeload.github.com. Forwarding the Bearer token
-    to that domain causes auth errors and can crash the download silently.
-    """
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_req is not None:
@@ -60,7 +63,6 @@ class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bool, str]:
-    """Download repo as a ZIP via the GitHub API and extract it."""
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -69,7 +71,6 @@ def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bo
         headers["Authorization"] = f"Bearer {token}"
 
     opener = urllib.request.build_opener(_NoAuthRedirectHandler)
-
     last_err = ""
     for branch in ("main", "master", "HEAD"):
         zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{branch}"
@@ -100,7 +101,6 @@ def _download_zip(owner: str, repo: str, dest: str, token: str = "") -> tuple[bo
 
 def _clone_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]:
     env = os.environ.copy()
-    # Prevent git from hanging trying to prompt for credentials in a headless env
     env["GIT_TERMINAL_PROMPT"] = "0"
     if token:
         parsed = _parse_github_url(github_url)
@@ -117,11 +117,7 @@ def _clone_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]
 
 
 def _fetch_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]:
-    """Try git clone first; fall back to ZIP download for restricted envs (e.g. HF Spaces)."""
     parsed = _parse_github_url(github_url)
-
-    # HuggingFace Spaces blocks outbound git operations via a credential interceptor,
-    # so skip straight to ZIP download when running there.
     in_hf_spaces = bool(os.environ.get("SPACE_ID"))
 
     if not in_hf_spaces:
@@ -139,8 +135,8 @@ def _fetch_repo(github_url: str, dest: str, token: str = "") -> tuple[bool, str]
     return False, err
 
 
-_MAX_LOG_LINES = 500   # keep tail of log to avoid unbounded memory growth on HF Spaces
-_ANALYSIS_TIMEOUT = 600  # 10-minute hard cap on the subprocess
+_MAX_LOG_LINES = 500
+_ANALYSIS_TIMEOUT = 600   # 10 minutes
 
 
 def _tail_log(log: str, max_lines: int = _MAX_LOG_LINES) -> str:
@@ -151,13 +147,16 @@ def _tail_log(log: str, max_lines: int = _MAX_LOG_LINES) -> str:
     return log
 
 
-def _update_key_visibility(model: str):
-    """Show/hide API key fields based on the selected provider."""
+# ============================================================================ #
+#  Tab 1 — Scalability QA Agent                                                #
+# ============================================================================ #
+
+def _update_key_visibility_qa(model: str):
     is_openai = model in OPENAI_MODELS
     return gr.update(visible=not is_openai), gr.update(visible=is_openai)
 
 
-def run_analysis(
+def run_qa_analysis(
     github_url: str,
     local_path: str,
     model: str,
@@ -170,7 +169,6 @@ def run_analysis(
     session_id = session_id or ""
     gh_token = gh_token.strip() or os.environ.get("GITHUB_TOKEN", "")
 
-    # Pick the right API key based on provider
     if model in OPENAI_MODELS:
         api_key = openai_key.strip() or os.environ.get("OPENAI_API_KEY", "")
         if not api_key:
@@ -240,7 +238,6 @@ def run_analysis(
                 cwd=str(Path(__file__).parent),
             )
 
-            # Enforce a hard timeout so a hung API call can't stall HF Spaces forever.
             def _kill_on_timeout():
                 nonlocal timed_out
                 try:
@@ -310,103 +307,343 @@ def load_report(analysis_id, session_id: str = "") -> str:
     return db.get_report(int(analysis_id), session_id or "")
 
 
-with gr.Blocks(title="Scalability QA Agent") as demo:
+# ============================================================================ #
+#  Tab 2 — Website Design Analyzer                                             #
+# ============================================================================ #
+
+def run_design_analysis(
+    url_or_github: str,
+    local_path: str,
+    model: str,
+    anthropic_key: str,
+    gh_token: str,
+    verbose: bool,
+):
+    """
+    Design analysis runner.
+
+    Accepts either:
+      - A live website URL  (https://…)  → passed directly to the agent
+      - A GitHub repo URL  (https://github.com/…) → cloned, then analysed as repo
+      - A local path       (/path/to/repo)         → analysed as repo
+    """
+    api_key = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        yield "❌ Anthropic API key is required.", ""
+        return
+
+    gh_token = gh_token.strip() or os.environ.get("GITHUB_TOKEN", "")
+    url_or_github = url_or_github.strip()
+    local_path = local_path.strip()
+
+    if not url_or_github and not local_path:
+        yield "❌ Provide a website URL, GitHub repo URL, or a local path.", ""
+        return
+
+    clone_dir = None
+    target = ""
+
+    try:
+        if local_path:
+            if not Path(local_path).exists():
+                yield f"❌ Path does not exist: {local_path}", ""
+                return
+            target = local_path
+            log = ""
+
+        elif _parse_github_url(url_or_github):
+            # GitHub repo → download and analyse as a local repo
+            clone_dir = tempfile.mkdtemp(prefix="design_agent_clone_")
+            log = f"⬇️  Fetching {url_or_github} …\n"
+            yield log, ""
+            ok, err = _fetch_repo(url_or_github, clone_dir, gh_token)
+            if not ok:
+                yield log + f"❌ Clone failed:\n{err}", ""
+                return
+            target = clone_dir
+            log += "✅ Fetched. Starting design analysis…\n\n"
+            yield log, ""
+
+        else:
+            # Live website URL
+            target = url_or_github
+            log = f"🌐 Analysing live site: {target}\n\n"
+            yield log, ""
+
+        report_file = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w")
+        report_path = report_file.name
+        report_file.close()
+
+        cmd = [
+            sys.executable, "-m", "design_agent.cli",
+            target,
+            "--output", report_path,
+            "--model", model,
+        ]
+        if verbose:
+            cmd.append("--verbose")
+
+        env = os.environ.copy()
+        env["ANTHROPIC_API_KEY"] = api_key
+
+        start = time.time()
+        timed_out = False
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                cwd=str(Path(__file__).parent),
+            )
+
+            def _kill_on_timeout():
+                nonlocal timed_out
+                try:
+                    process.wait(timeout=_ANALYSIS_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    process.kill()
+
+            watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+            watchdog.start()
+
+            for line in process.stdout:
+                log += line
+                log = _tail_log(log)
+                yield log, ""
+
+            process.wait()
+            watchdog.join(timeout=1)
+
+            if timed_out:
+                log += f"\n⏱️  Analysis timed out after {_ANALYSIS_TIMEOUT // 60} minutes.\n"
+                yield log, ""
+                return
+
+            report = ""
+            if Path(report_path).exists():
+                report = Path(report_path).read_text(encoding="utf-8")
+
+            yield log, report
+        finally:
+            try:
+                os.unlink(report_path)
+            except OSError:
+                pass
+
+    finally:
+        if clone_dir:
+            shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+# ============================================================================ #
+#  Gradio UI                                                                   #
+# ============================================================================ #
+
+_DESIGN_EXAMPLES = [
+    "https://linear.app",
+    "https://vercel.com",
+    "https://stripe.com",
+    "https://notion.so",
+]
+
+with gr.Blocks(title="AI Agent Platform", theme=gr.themes.Soft()) as demo:
     session_state = gr.State(value="")
-    gr.Markdown("# Production Scalability QA Agent")
+
+    gr.Markdown("# 🤖 AI Agent Platform")
     gr.Markdown(
-        "Analyse any codebase for production scalability issues using Claude or GPT-4o. "
-        "Paste a GitHub URL **or** a local folder path."
+        "Two specialised agents powered by Claude — "
+        "analyse codebases for **scalability** or audit any website for **design quality**."
     )
-
-    with gr.Row():
-        github_input = gr.Textbox(
-            label="GitHub repo URL",
-            placeholder="https://github.com/owner/repo",
-            scale=3,
-        )
-        model_dropdown = gr.Dropdown(
-            label="Model",
-            choices=_ALL_MODELS,
-            value=_DEFAULT_MODEL,
-            scale=2,
-        )
-
-    with gr.Row():
-        api_key_input = gr.Textbox(
-            label="Anthropic API key",
-            placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
-            type="password",
-            scale=2,
-            visible=True,
-        )
-        openai_key_input = gr.Textbox(
-            label="OpenAI API key",
-            placeholder="sk-…  (or set OPENAI_API_KEY env var)",
-            type="password",
-            scale=2,
-            visible=False,
-        )
-        gh_token_input = gr.Textbox(
-            label="GitHub token (optional — required for private repos)",
-            placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
-            type="password",
-            scale=2,
-        )
-
-    local_input = gr.Textbox(
-        label="— or — local path",
-        placeholder="/path/to/your/project  (leave blank if using GitHub URL above)",
-    )
-
-    verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
-    run_btn = gr.Button("Analyse", variant="primary", size="lg")
 
     with gr.Tabs():
-        with gr.Tab("Agent log"):
-            log_output = gr.Textbox(
-                label="Live output",
-                lines=25,
-                max_lines=25,
-                interactive=False,
+
+        # ------------------------------------------------------------------ #
+        #  Tab 1 — Scalability QA                                             #
+        # ------------------------------------------------------------------ #
+        with gr.Tab("⚡ Scalability QA"):
+            gr.Markdown("## Production Scalability QA Agent")
+            gr.Markdown(
+                "Analyse any codebase for production scalability issues. "
+                "Paste a GitHub URL **or** a local folder path."
             )
-        with gr.Tab("Report"):
-            report_output = gr.Markdown(label="Scalability report")
-        with gr.Tab("History"):
-            refresh_btn = gr.Button("Refresh", size="sm")
-            history_df = gr.Dataframe(
-                headers=["ID", "Source", "Date", "Duration", "Critical", "High", "Medium", "Low"],
-                interactive=False,
-                wrap=True,
-            )
-            gr.Markdown("### Load a past report")
+
             with gr.Row():
-                id_input = gr.Number(label="Report ID", precision=0, scale=1)
-                load_btn = gr.Button("Load", scale=1)
-            past_report = gr.Markdown()
+                qa_github_input = gr.Textbox(
+                    label="GitHub repo URL",
+                    placeholder="https://github.com/owner/repo",
+                    scale=3,
+                )
+                qa_model_dropdown = gr.Dropdown(
+                    label="Model",
+                    choices=_QA_ALL_MODELS,
+                    value=_DEFAULT_MODEL,
+                    scale=2,
+                )
 
-    # Swap key field visibility when the model changes
-    model_dropdown.change(
-        fn=_update_key_visibility,
-        inputs=model_dropdown,
-        outputs=[api_key_input, openai_key_input],
-    )
+            with gr.Row():
+                qa_api_key_input = gr.Textbox(
+                    label="Anthropic API key",
+                    placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
+                    type="password",
+                    scale=2,
+                    visible=True,
+                )
+                qa_openai_key_input = gr.Textbox(
+                    label="OpenAI API key",
+                    placeholder="sk-…  (or set OPENAI_API_KEY env var)",
+                    type="password",
+                    scale=2,
+                    visible=False,
+                )
+                qa_gh_token_input = gr.Textbox(
+                    label="GitHub token (optional — required for private repos)",
+                    placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
+                    type="password",
+                    scale=2,
+                )
 
-    run_btn.click(
-        fn=run_analysis,
-        inputs=[
-            github_input, local_input, model_dropdown,
-            api_key_input, openai_key_input,
-            gh_token_input, verbose_cb, session_state,
-        ],
-        outputs=[log_output, report_output],
-    )
+            qa_local_input = gr.Textbox(
+                label="— or — local path",
+                placeholder="/path/to/your/project",
+            )
+            qa_verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
+            qa_run_btn = gr.Button("Analyse Scalability", variant="primary", size="lg")
+
+            with gr.Tabs():
+                with gr.Tab("Agent log"):
+                    qa_log_output = gr.Textbox(
+                        label="Live output",
+                        lines=25,
+                        max_lines=25,
+                        interactive=False,
+                    )
+                with gr.Tab("Report"):
+                    qa_report_output = gr.Markdown(label="Scalability report")
+                with gr.Tab("History"):
+                    qa_refresh_btn = gr.Button("Refresh", size="sm")
+                    qa_history_df = gr.Dataframe(
+                        headers=["ID", "Source", "Date", "Duration", "Critical", "High", "Medium", "Low"],
+                        interactive=False,
+                        wrap=True,
+                    )
+                    gr.Markdown("### Load a past report")
+                    with gr.Row():
+                        qa_id_input = gr.Number(label="Report ID", precision=0, scale=1)
+                        qa_load_btn = gr.Button("Load", scale=1)
+                    qa_past_report = gr.Markdown()
+
+            qa_model_dropdown.change(
+                fn=_update_key_visibility_qa,
+                inputs=qa_model_dropdown,
+                outputs=[qa_api_key_input, qa_openai_key_input],
+            )
+            qa_run_btn.click(
+                fn=run_qa_analysis,
+                inputs=[
+                    qa_github_input, qa_local_input, qa_model_dropdown,
+                    qa_api_key_input, qa_openai_key_input,
+                    qa_gh_token_input, qa_verbose_cb, session_state,
+                ],
+                outputs=[qa_log_output, qa_report_output],
+            )
+            qa_refresh_btn.click(fn=load_history, inputs=session_state, outputs=qa_history_df)
+            qa_load_btn.click(fn=load_report, inputs=[qa_id_input, session_state], outputs=qa_past_report)
+
+        # ------------------------------------------------------------------ #
+        #  Tab 2 — Design Analyzer                                            #
+        # ------------------------------------------------------------------ #
+        with gr.Tab("🎨 Design Analyzer"):
+            gr.Markdown("## Website Design Analyzer")
+            gr.Markdown(
+                "Audit any website or GitHub repo for design quality — "
+                "inspired by the greatest SaaS designs: **Linear, Stripe, Vercel, Notion, Loom**.\n\n"
+                "The agent navigates the site, extracts CSS design tokens, checks colour palette "
+                "consistency, typography scale, spacing grid, CTA hierarchy, and more — then "
+                "produces a prioritised simplification roadmap."
+            )
+
+            with gr.Row():
+                design_url_input = gr.Textbox(
+                    label="Website URL or GitHub repo URL",
+                    placeholder=(
+                        "https://yourstartup.com   OR   https://github.com/owner/repo"
+                    ),
+                    scale=3,
+                )
+                design_model_dropdown = gr.Dropdown(
+                    label="Model",
+                    choices=_DESIGN_MODELS,
+                    value=_DEFAULT_MODEL,
+                    scale=2,
+                )
+
+            with gr.Row():
+                design_api_key_input = gr.Textbox(
+                    label="Anthropic API key",
+                    placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
+                    type="password",
+                    scale=3,
+                )
+                design_gh_token_input = gr.Textbox(
+                    label="GitHub token (optional — for private repos)",
+                    placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
+                    type="password",
+                    scale=2,
+                )
+
+            design_local_input = gr.Textbox(
+                label="— or — local repo path",
+                placeholder="/path/to/your/frontend  (leave blank if using URL above)",
+            )
+
+            with gr.Row():
+                design_verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
+                gr.Markdown(
+                    "💡 **Tip:** Try a GitHub repo URL to get code-level design system analysis "
+                    "(CSS tokens, component consistency, hardcoded colours)."
+                )
+
+            design_run_btn = gr.Button("Analyse Design", variant="primary", size="lg")
+
+            gr.Examples(
+                examples=[[url] for url in _DESIGN_EXAMPLES],
+                inputs=[design_url_input],
+                label="Try a world-class SaaS site",
+            )
+
+            with gr.Tabs():
+                with gr.Tab("Agent log"):
+                    design_log_output = gr.Textbox(
+                        label="Live output",
+                        lines=25,
+                        max_lines=25,
+                        interactive=False,
+                    )
+                with gr.Tab("Design Report"):
+                    design_report_output = gr.Markdown(label="Design audit report")
+
+            design_run_btn.click(
+                fn=run_design_analysis,
+                inputs=[
+                    design_url_input,
+                    design_local_input,
+                    design_model_dropdown,
+                    design_api_key_input,
+                    design_gh_token_input,
+                    design_verbose_cb,
+                ],
+                outputs=[design_log_output, design_report_output],
+            )
+
     def _on_load() -> tuple[str, list]:
         sid = str(uuid.uuid4())
         return sid, load_history(sid)
 
-    refresh_btn.click(fn=load_history, inputs=session_state, outputs=history_df)
-    load_btn.click(fn=load_report, inputs=[id_input, session_state], outputs=past_report)
-    demo.load(fn=_on_load, inputs=None, outputs=[session_state, history_df])
+    demo.load(fn=_on_load, inputs=None, outputs=[session_state, qa_history_df])
+
 
 if __name__ == "__main__":
     demo.launch(theme=gr.themes.Soft())
