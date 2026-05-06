@@ -31,6 +31,18 @@ def init_db() -> None:
                 "ALTER TABLE analyses ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
             )
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS design_analyses (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT    NOT NULL DEFAULT '',
+                source     TEXT    NOT NULL,
+                timestamp  TEXT    NOT NULL,
+                duration_s REAL,
+                report_md  TEXT,
+                score      INTEGER DEFAULT 0
+            )
+        """)
+
 
 def save_analysis(
     source: str, report_md: str, duration_s: float, session_id: str = ""
@@ -79,6 +91,55 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def save_design_analysis(
+    source: str, report_md: str, duration_s: float, session_id: str = ""
+) -> int:
+    score = _extract_design_score(report_md)
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO design_analyses "
+            "(session_id, source, timestamp, duration_s, report_md, score) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                session_id,
+                source,
+                datetime.utcnow().isoformat(timespec="seconds"),
+                round(duration_s),
+                report_md,
+                score,
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_design_history(session_id: str = "") -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, source, timestamp, duration_s, score "
+            "FROM design_analyses WHERE session_id = ? ORDER BY timestamp DESC LIMIT 100",
+            (session_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_design_report(analysis_id: int, session_id: str = "") -> str:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT report_md FROM design_analyses WHERE id = ? AND session_id = ?",
+            (analysis_id, session_id),
+        ).fetchone()
+    return row["report_md"] if row else "Report not found."
+
+
+def _extract_design_score(report_md: str) -> int:
+    if not report_md:
+        return 0
+    m = re.search(r"score[^0-9]*(\d{1,2})\s*/\s*10", report_md, re.IGNORECASE)
+    if m:
+        return min(10, max(0, int(m.group(1))))
+    return 0
 
 
 def _count_severity(report_md: str) -> dict:
