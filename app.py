@@ -1,5 +1,5 @@
 """
-Gradio web interface for the Production Scalability QA Agent.
+Gradio web interface — Production Scalability QA Agent + SEO/GEO Optimizer.
 
 Usage:
     python app.py
@@ -24,6 +24,7 @@ import gradio as gr
 
 import db
 from qa_agent.agent import ANTHROPIC_MODELS
+from seo_agent.agent import SEOGEOAgent
 
 try:
     from qa_agent.agent_openai import OPENAI_MODELS
@@ -310,103 +311,331 @@ def load_report(analysis_id, session_id: str = "") -> str:
     return db.get_report(int(analysis_id), session_id or "")
 
 
-with gr.Blocks(title="Scalability QA Agent") as demo:
+# ---------------------------------------------------------------------------
+# SEO/GEO agent runner
+# ---------------------------------------------------------------------------
+
+def run_seo_analysis(
+    url_input: str,
+    pasted_content: str,
+    keywords_raw: str,
+    competitor_url: str,
+    mode: str,
+    model: str,
+    anthropic_key: str,
+    verbose: bool,
+):
+    """Stream SEO/GEO agent output to the Gradio interface."""
+    api_key = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        yield "❌ Anthropic API key is required.", ""
+        return
+
+    content = url_input.strip() or pasted_content.strip()
+    if not content:
+        yield "❌ Provide a URL or paste your content.", ""
+        return
+
+    keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+    competitor_urls = [competitor_url.strip()] if competitor_url.strip() else []
+
+    report_file = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w")
+    report_path = report_file.name
+    report_file.close()
+
+    is_url = content.startswith(("http://", "https://"))
+    label = content if is_url else "(pasted content)"
+
+    log = f"🚀  Starting SEO/GEO analysis for: {label}\n"
+    if keywords:
+        log += f"🎯  Target keywords: {', '.join(keywords)}\n"
+    if competitor_urls:
+        log += f"🏁  Competitor: {competitor_urls[0]}\n"
+    log += f"⚙️   Mode: {mode}  |  Model: {model}\n"
+    log += "=" * 60 + "\n\n"
+    yield log, ""
+
+    # Build CLI-friendly command via a subprocess so we get streaming stdout
+    cmd = [
+        sys.executable, "-c",
+        f"""
+import sys, os
+sys.path.insert(0, {str(Path(__file__).parent)!r})
+os.environ['ANTHROPIC_API_KEY'] = {api_key!r}
+from seo_agent.agent import SEOGEOAgent
+agent = SEOGEOAgent(model={model!r})
+agent.run(
+    content={content!r},
+    target_keywords={keywords!r},
+    competitor_urls={competitor_urls!r},
+    mode={mode!r},
+    output_report={report_path!r},
+    verbose={verbose!r},
+)
+""",
+    ]
+
+    start = time.time()
+    timed_out = False
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        def _kill_on_timeout():
+            nonlocal timed_out
+            try:
+                process.wait(timeout=_ANALYSIS_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.kill()
+
+        watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+        watchdog.start()
+
+        for line in process.stdout:
+            log += line
+            log = _tail_log(log)
+            yield log, ""
+
+        process.wait()
+        watchdog.join(timeout=1)
+
+        if timed_out:
+            log += f"\n⏱️  Timed out after {_ANALYSIS_TIMEOUT // 60} minutes.\n"
+            yield log, ""
+            return
+
+        report = ""
+        if Path(report_path).exists():
+            report = Path(report_path).read_text(encoding="utf-8")
+
+        duration = time.time() - start
+        log += f"\n\n✅  Done in {int(duration)}s"
+        yield log, report
+
+    finally:
+        try:
+            os.unlink(report_path)
+        except OSError:
+            pass
+
+
+_ANTHROPIC_ONLY_MODELS = _ANTHROPIC_MODELS  # SEO agent is Anthropic-only (uses extended thinking)
+
+with gr.Blocks(title="AI Agent Suite", theme=gr.themes.Soft()) as demo:
     session_state = gr.State(value="")
-    gr.Markdown("# Production Scalability QA Agent")
-    gr.Markdown(
-        "Analyse any codebase for production scalability issues using Claude or GPT-4o. "
-        "Paste a GitHub URL **or** a local folder path."
-    )
 
-    with gr.Row():
-        github_input = gr.Textbox(
-            label="GitHub repo URL",
-            placeholder="https://github.com/owner/repo",
-            scale=3,
-        )
-        model_dropdown = gr.Dropdown(
-            label="Model",
-            choices=_ALL_MODELS,
-            value=_DEFAULT_MODEL,
-            scale=2,
-        )
-
-    with gr.Row():
-        api_key_input = gr.Textbox(
-            label="Anthropic API key",
-            placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
-            type="password",
-            scale=2,
-            visible=True,
-        )
-        openai_key_input = gr.Textbox(
-            label="OpenAI API key",
-            placeholder="sk-…  (or set OPENAI_API_KEY env var)",
-            type="password",
-            scale=2,
-            visible=False,
-        )
-        gh_token_input = gr.Textbox(
-            label="GitHub token (optional — required for private repos)",
-            placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
-            type="password",
-            scale=2,
-        )
-
-    local_input = gr.Textbox(
-        label="— or — local path",
-        placeholder="/path/to/your/project  (leave blank if using GitHub URL above)",
-    )
-
-    verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
-    run_btn = gr.Button("Analyse", variant="primary", size="lg")
+    gr.Markdown("# AI Agent Suite")
 
     with gr.Tabs():
-        with gr.Tab("Agent log"):
-            log_output = gr.Textbox(
-                label="Live output",
-                lines=25,
-                max_lines=25,
-                interactive=False,
+        # ------------------------------------------------------------------ #
+        # Tab 1 — SEO / GEO Optimizer                                         #
+        # ------------------------------------------------------------------ #
+        with gr.Tab("SEO / GEO Optimizer"):
+            gr.Markdown(
+                "## SEO + GEO Optimizer\n"
+                "Analyse any URL or content for search engine and AI citation opportunities. "
+                "Get scored recommendations, optimised meta tags, schema markup, and an optional "
+                "full content rewrite — all powered by Claude with extended thinking."
             )
-        with gr.Tab("Report"):
-            report_output = gr.Markdown(label="Scalability report")
-        with gr.Tab("History"):
-            refresh_btn = gr.Button("Refresh", size="sm")
-            history_df = gr.Dataframe(
-                headers=["ID", "Source", "Date", "Duration", "Critical", "High", "Medium", "Low"],
-                interactive=False,
-                wrap=True,
-            )
-            gr.Markdown("### Load a past report")
+
             with gr.Row():
-                id_input = gr.Number(label="Report ID", precision=0, scale=1)
-                load_btn = gr.Button("Load", scale=1)
-            past_report = gr.Markdown()
+                seo_url_input = gr.Textbox(
+                    label="URL to analyse",
+                    placeholder="https://yourwebsite.com/page",
+                    scale=3,
+                )
+                seo_mode_dropdown = gr.Dropdown(
+                    label="Mode",
+                    choices=["analyze", "rewrite", "both"],
+                    value="analyze",
+                    scale=1,
+                    info="analyze = report only | rewrite = optimised content | both = report + rewrite",
+                )
 
-    # Swap key field visibility when the model changes
-    model_dropdown.change(
-        fn=_update_key_visibility,
-        inputs=model_dropdown,
-        outputs=[api_key_input, openai_key_input],
-    )
+            seo_content_input = gr.Textbox(
+                label="— or — paste your content / HTML directly",
+                placeholder="Paste raw text or HTML here if you don't have a live URL.",
+                lines=6,
+            )
 
-    run_btn.click(
-        fn=run_analysis,
-        inputs=[
-            github_input, local_input, model_dropdown,
-            api_key_input, openai_key_input,
-            gh_token_input, verbose_cb, session_state,
-        ],
-        outputs=[log_output, report_output],
-    )
+            with gr.Row():
+                seo_keywords_input = gr.Textbox(
+                    label="Target keywords (comma-separated)",
+                    placeholder="e.g.  SEO optimisation, AI search, GEO strategy",
+                    scale=3,
+                )
+                seo_competitor_input = gr.Textbox(
+                    label="Competitor URL (optional)",
+                    placeholder="https://competitor.com/page",
+                    scale=2,
+                )
+
+            with gr.Row():
+                seo_api_key_input = gr.Textbox(
+                    label="Anthropic API key",
+                    placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
+                    type="password",
+                    scale=2,
+                )
+                seo_model_dropdown = gr.Dropdown(
+                    label="Model",
+                    choices=_ANTHROPIC_ONLY_MODELS,
+                    value=_DEFAULT_MODEL,
+                    scale=2,
+                )
+                seo_verbose_cb = gr.Checkbox(
+                    label="Verbose — show model reasoning",
+                    value=False,
+                    scale=1,
+                )
+
+            seo_run_btn = gr.Button("Run SEO/GEO Analysis", variant="primary", size="lg")
+
+            with gr.Tabs():
+                with gr.Tab("Agent log"):
+                    seo_log_output = gr.Textbox(
+                        label="Live output",
+                        lines=28,
+                        max_lines=28,
+                        interactive=False,
+                    )
+                with gr.Tab("Report / Rewrite"):
+                    seo_report_output = gr.Markdown(label="SEO/GEO Report")
+
+            gr.Markdown(
+                "**Tip — plug into any website:** This agent is also accessible via the "
+                "Gradio API. Click **Use via API** at the bottom of the page to get the "
+                "endpoint URL and call it programmatically from your CMS, browser extension, "
+                "or CI pipeline."
+            )
+
+            def _get_seo_content(url: str, pasted: str) -> str:
+                return url.strip() or pasted.strip()
+
+            seo_run_btn.click(
+                fn=run_seo_analysis,
+                inputs=[
+                    seo_url_input, seo_content_input,
+                    seo_keywords_input, seo_competitor_input,
+                    seo_mode_dropdown, seo_model_dropdown,
+                    seo_api_key_input, seo_verbose_cb,
+                ],
+                outputs=[seo_log_output, seo_report_output],
+            )
+
+            # When URL is filled, clear the paste box hint (and vice versa)
+            seo_url_input.change(
+                fn=lambda u: gr.update(placeholder="URL provided — paste box ignored." if u.strip() else "Paste raw text or HTML here if you don't have a live URL."),
+                inputs=seo_url_input,
+                outputs=seo_content_input,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Tab 2 — Scalability QA Agent (existing)                             #
+        # ------------------------------------------------------------------ #
+        with gr.Tab("Scalability QA"):
+            gr.Markdown(
+                "## Production Scalability QA Agent\n"
+                "Analyse any codebase for production scalability issues using Claude or GPT-4o. "
+                "Paste a GitHub URL **or** a local folder path."
+            )
+
+            with gr.Row():
+                github_input = gr.Textbox(
+                    label="GitHub repo URL",
+                    placeholder="https://github.com/owner/repo",
+                    scale=3,
+                )
+                model_dropdown = gr.Dropdown(
+                    label="Model",
+                    choices=_ALL_MODELS,
+                    value=_DEFAULT_MODEL,
+                    scale=2,
+                )
+
+            with gr.Row():
+                api_key_input = gr.Textbox(
+                    label="Anthropic API key",
+                    placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
+                    type="password",
+                    scale=2,
+                    visible=True,
+                )
+                openai_key_input = gr.Textbox(
+                    label="OpenAI API key",
+                    placeholder="sk-…  (or set OPENAI_API_KEY env var)",
+                    type="password",
+                    scale=2,
+                    visible=False,
+                )
+                gh_token_input = gr.Textbox(
+                    label="GitHub token (optional — required for private repos)",
+                    placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
+                    type="password",
+                    scale=2,
+                )
+
+            local_input = gr.Textbox(
+                label="— or — local path",
+                placeholder="/path/to/your/project  (leave blank if using GitHub URL above)",
+            )
+
+            verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
+            run_btn = gr.Button("Analyse", variant="primary", size="lg")
+
+            with gr.Tabs():
+                with gr.Tab("Agent log"):
+                    log_output = gr.Textbox(
+                        label="Live output",
+                        lines=25,
+                        max_lines=25,
+                        interactive=False,
+                    )
+                with gr.Tab("Report"):
+                    report_output = gr.Markdown(label="Scalability report")
+                with gr.Tab("History"):
+                    refresh_btn = gr.Button("Refresh", size="sm")
+                    history_df = gr.Dataframe(
+                        headers=["ID", "Source", "Date", "Duration", "Critical", "High", "Medium", "Low"],
+                        interactive=False,
+                        wrap=True,
+                    )
+                    gr.Markdown("### Load a past report")
+                    with gr.Row():
+                        id_input = gr.Number(label="Report ID", precision=0, scale=1)
+                        load_btn = gr.Button("Load", scale=1)
+                    past_report = gr.Markdown()
+
+            model_dropdown.change(
+                fn=_update_key_visibility,
+                inputs=model_dropdown,
+                outputs=[api_key_input, openai_key_input],
+            )
+
+            run_btn.click(
+                fn=run_analysis,
+                inputs=[
+                    github_input, local_input, model_dropdown,
+                    api_key_input, openai_key_input,
+                    gh_token_input, verbose_cb, session_state,
+                ],
+                outputs=[log_output, report_output],
+            )
+
+            refresh_btn.click(fn=load_history, inputs=session_state, outputs=history_df)
+            load_btn.click(fn=load_report, inputs=[id_input, session_state], outputs=past_report)
+
     def _on_load() -> tuple[str, list]:
         sid = str(uuid.uuid4())
         return sid, load_history(sid)
 
-    refresh_btn.click(fn=load_history, inputs=session_state, outputs=history_df)
-    load_btn.click(fn=load_report, inputs=[id_input, session_state], outputs=past_report)
     demo.load(fn=_on_load, inputs=None, outputs=[session_state, history_df])
 
 if __name__ == "__main__":
-    demo.launch(theme=gr.themes.Soft())
+    demo.launch()
