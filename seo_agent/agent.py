@@ -7,6 +7,12 @@ import anthropic
 from .prompts import SEO_GEO_SYSTEM_PROMPT
 from .tools import TOOL_DEFINITIONS, execute_tool
 
+ANTHROPIC_MODELS = {
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+}
+
 
 class SEOGEOAgent:
     """
