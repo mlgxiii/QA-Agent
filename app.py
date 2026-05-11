@@ -14,6 +14,7 @@ import time
 import threading
 from pathlib import Path
 
+import anthropic
 import gradio as gr
 
 import db
@@ -70,6 +71,69 @@ agent.run(
 
 
 # ---------------------------------------------------------------------------
+# Chat with report
+# ---------------------------------------------------------------------------
+
+def chat_with_report(message: str, history: list, report: str, api_key: str, model: str):
+    """Stream a Claude response grounded in the current report."""
+    api_key = api_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    if not api_key:
+        history = history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "❌ API key required — enter it in the Analyser tab."},
+        ]
+        yield history, history
+        return
+
+    if not report or not report.strip():
+        history = history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "No report loaded yet. Run an analysis first, then ask me anything about it."},
+        ]
+        yield history, history
+        return
+
+    system = f"""You are an expert SEO and GEO (Generative Engine Optimization) consultant. \
+The user has just received the analysis report below and wants to discuss it, ask follow-up \
+questions, request rewrites of specific sections, or dig deeper into any recommendation.
+
+Be specific — reference exact findings, scores, and quoted text from the report. \
+Keep answers concise unless the user asks for detail. \
+If asked to rewrite a section, do it fully. \
+If asked why a score is what it is, explain the exact signals that drove it.
+
+--- REPORT START ---
+{report[:15000]}
+--- REPORT END ---"""
+
+    # Build message list from history
+    messages = [{"role": h["role"], "content": h["content"]} for h in history]
+    messages.append({"role": "user", "content": message})
+
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": ""},
+    ]
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    with client.messages.stream(
+        model=model,
+        max_tokens=2048,
+        system=system,
+        messages=messages,
+    ) as stream:
+        for text in stream.text_stream:
+            history[-1]["content"] += text
+            yield history, history
+
+
+def clear_chat():
+    return [], []
+
+
+# ---------------------------------------------------------------------------
 # Analyser (analyze / rewrite / both / gap)
 # ---------------------------------------------------------------------------
 
@@ -86,12 +150,12 @@ def run_seo_analysis(
 ):
     api_key = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        yield "❌ Anthropic API key is required.", ""
+        yield "❌ Anthropic API key is required.", "", ""
         return
 
     content = url_input.strip() or pasted_content.strip()
     if not content:
-        yield "❌ Provide a URL or paste your content.", ""
+        yield "❌ Provide a URL or paste your content.", "", ""
         return
 
     keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
@@ -106,7 +170,7 @@ def run_seo_analysis(
     if competitor_urls:
         log += f"🏁  Competitors: {len(competitor_urls)}\n"
     log += f"⚙️   Model: {model}\n" + "=" * 60 + "\n\n"
-    yield log, ""
+    yield log, "", ""
 
     report_file = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w")
     report_path = report_file.name
@@ -135,14 +199,14 @@ def run_seo_analysis(
         for line in process.stdout:
             log += line
             log = _tail_log(log)
-            yield log, ""
+            yield log, "", ""
 
         process.wait()
         watchdog.join(timeout=1)
 
         if timed_out:
             log += f"\n⏱️  Timed out after {_ANALYSIS_TIMEOUT // 60} minutes.\n"
-            yield log, ""
+            yield log, "", ""
             return
 
         report = ""
@@ -154,8 +218,8 @@ def run_seo_analysis(
         if report:
             db.save_seo_analysis(label, report, duration, mode, session_id or "")
 
-        log += f"\n\n✅  Done in {int(duration)}s"
-        yield log, report
+        log += f"\n\n✅  Done in {int(duration)}s  — switch to the **Report** tab, then ask questions below."
+        yield log, report, report
 
     finally:
         try:
@@ -180,10 +244,10 @@ def run_content_brief(
 ):
     api_key = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        yield "❌ Anthropic API key is required.", ""
+        yield "❌ Anthropic API key is required.", "", ""
         return
     if not keyword.strip():
-        yield "❌ Enter a primary keyword or topic.", ""
+        yield "❌ Enter a primary keyword or topic.", "", ""
         return
 
     related = [k.strip() for k in related_keywords_raw.split(",") if k.strip()]
@@ -195,9 +259,9 @@ def run_content_brief(
     if audience:
         log += f"👥  Audience: {audience}\n"
     if competitor_urls:
-        log += f"🏁  Competitors to analyse: {len(competitor_urls)}\n"
+        log += f"🏁  Competitors: {len(competitor_urls)}\n"
     log += "=" * 60 + "\n\n"
-    yield log, ""
+    yield log, "", ""
 
     report_file = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w")
     report_path = report_file.name
@@ -226,14 +290,14 @@ def run_content_brief(
         for line in process.stdout:
             log += line
             log = _tail_log(log)
-            yield log, ""
+            yield log, "", ""
 
         process.wait()
         watchdog.join(timeout=1)
 
         if timed_out:
             log += f"\n⏱️  Timed out.\n"
-            yield log, ""
+            yield log, "", ""
             return
 
         report = ""
@@ -244,8 +308,8 @@ def run_content_brief(
         if report:
             db.save_seo_analysis(keyword.strip(), report, duration, "brief", session_id or "")
 
-        log += f"\n\n✅  Brief ready in {int(duration)}s"
-        yield log, report
+        log += f"\n\n✅  Brief ready in {int(duration)}s  — switch to the **Brief** tab, then ask questions below."
+        yield log, report, report
 
     finally:
         try:
@@ -304,7 +368,7 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
         with gr.Tab("Analyser"):
             gr.Markdown(
                 "Audit any URL or content for **SEO score**, **GEO score** (AI citation readiness), "
-                "and get an **AI answer preview**, **FAQ generator**, optimised meta tags, and schema."
+                "an **AI answer preview**, **FAQ generator**, optimised meta tags, and schema."
             )
 
             with gr.Row():
@@ -354,12 +418,40 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
 
             run_btn = gr.Button("Run Analysis", variant="primary", size="lg")
 
+            # Report state — populated when analysis completes, fed into chat
+            analyser_report_state = gr.State(value="")
+
             with gr.Tabs():
                 with gr.Tab("Agent log"):
-                    log_output = gr.Textbox(label="Live output", lines=28, max_lines=28, interactive=False)
+                    log_output = gr.Textbox(label="Live output", lines=20, max_lines=20, interactive=False)
                 with gr.Tab("Report / Rewrite"):
                     report_output = gr.Markdown(label="Report")
 
+            # Chat panel
+            gr.Markdown("---\n### 💬 Ask questions about the report")
+            gr.Markdown(
+                "After the analysis completes, ask anything: "
+                "*\"Why is my GEO score low?\", \"Rewrite the introduction\", "
+                "\"Which recommendation should I do first?\", \"Explain the FAQ score\"*"
+            )
+            analyser_chatbot = gr.Chatbot(
+                label="Report chat",
+                type="messages",
+                height=400,
+                show_copy_button=True,
+            )
+            analyser_chat_state = gr.State(value=[])
+            with gr.Row():
+                analyser_chat_input = gr.Textbox(
+                    placeholder="Ask anything about the report…",
+                    label="",
+                    scale=5,
+                    container=False,
+                )
+                analyser_send_btn = gr.Button("Send", variant="primary", scale=1)
+                analyser_clear_btn = gr.Button("Clear", scale=1)
+
+            # Wiring
             url_input.change(
                 fn=lambda u: gr.update(placeholder="URL provided — paste box ignored." if u.strip() else "Paste raw text or HTML if you don't have a live URL."),
                 inputs=url_input, outputs=content_input,
@@ -368,8 +460,27 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
                 fn=run_seo_analysis,
                 inputs=[url_input, content_input, keywords_input, competitor_input,
                         mode_dropdown, model_dropdown, api_key_input, verbose_cb, session_state],
-                outputs=[log_output, report_output],
+                outputs=[log_output, report_output, analyser_report_state],
             )
+
+            def _send_chat(message, history, report, api_key, model):
+                yield from chat_with_report(message, history, report, api_key, model)
+
+            analyser_send_btn.click(
+                fn=_send_chat,
+                inputs=[analyser_chat_input, analyser_chat_state, analyser_report_state,
+                        api_key_input, model_dropdown],
+                outputs=[analyser_chatbot, analyser_chat_state],
+            ).then(fn=lambda: "", outputs=analyser_chat_input)
+
+            analyser_chat_input.submit(
+                fn=_send_chat,
+                inputs=[analyser_chat_input, analyser_chat_state, analyser_report_state,
+                        api_key_input, model_dropdown],
+                outputs=[analyser_chatbot, analyser_chat_state],
+            ).then(fn=lambda: "", outputs=analyser_chat_input)
+
+            analyser_clear_btn.click(fn=clear_chat, outputs=[analyser_chatbot, analyser_chat_state])
 
         # ------------------------------------------------------------------ #
         # Tab 2 — Content Brief                                                #
@@ -398,7 +509,6 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
                 label="Related keywords (comma-separated, optional)",
                 placeholder="GEO strategy, AI search optimisation, Perplexity SEO",
             )
-
             brief_competitor_input = gr.Textbox(
                 label="Competitor URLs to benchmark (one per line, optional)",
                 placeholder="https://competitor.com/page",
@@ -419,19 +529,64 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
 
             brief_run_btn = gr.Button("Generate Content Brief", variant="primary", size="lg")
 
+            brief_report_state = gr.State(value="")
+
             with gr.Tabs():
                 with gr.Tab("Agent log"):
-                    brief_log_output = gr.Textbox(label="Live output", lines=28, max_lines=28, interactive=False)
+                    brief_log_output = gr.Textbox(label="Live output", lines=20, max_lines=20, interactive=False)
                 with gr.Tab("Brief"):
                     brief_output = gr.Markdown(label="Content Brief")
+
+            # Chat panel
+            gr.Markdown("---\n### 💬 Ask questions about the brief")
+            gr.Markdown(
+                "Iterate on the brief: "
+                "*\"Add more FAQ questions about pricing\", \"Make the outline longer\", "
+                "\"Change the target audience to developers\", \"What statistics should I find first?\"*"
+            )
+            brief_chatbot = gr.Chatbot(
+                label="Brief chat",
+                type="messages",
+                height=400,
+                show_copy_button=True,
+            )
+            brief_chat_state = gr.State(value=[])
+            with gr.Row():
+                brief_chat_input = gr.Textbox(
+                    placeholder="Ask anything about the brief…",
+                    label="",
+                    scale=5,
+                    container=False,
+                )
+                brief_send_btn = gr.Button("Send", variant="primary", scale=1)
+                brief_clear_btn = gr.Button("Clear", scale=1)
 
             brief_run_btn.click(
                 fn=run_content_brief,
                 inputs=[brief_keyword_input, brief_related_input, brief_audience_input,
                         brief_competitor_input, brief_model_dropdown, brief_api_key_input,
                         brief_verbose_cb, session_state],
-                outputs=[brief_log_output, brief_output],
+                outputs=[brief_log_output, brief_output, brief_report_state],
             )
+
+            def _send_brief_chat(message, history, report, api_key, model):
+                yield from chat_with_report(message, history, report, api_key, model)
+
+            brief_send_btn.click(
+                fn=_send_brief_chat,
+                inputs=[brief_chat_input, brief_chat_state, brief_report_state,
+                        brief_api_key_input, brief_model_dropdown],
+                outputs=[brief_chatbot, brief_chat_state],
+            ).then(fn=lambda: "", outputs=brief_chat_input)
+
+            brief_chat_input.submit(
+                fn=_send_brief_chat,
+                inputs=[brief_chat_input, brief_chat_state, brief_report_state,
+                        brief_api_key_input, brief_model_dropdown],
+                outputs=[brief_chatbot, brief_chat_state],
+            ).then(fn=lambda: "", outputs=brief_chat_input)
+
+            brief_clear_btn.click(fn=clear_chat, outputs=[brief_chatbot, brief_chat_state])
 
         # ------------------------------------------------------------------ #
         # Tab 3 — History                                                      #
@@ -455,12 +610,8 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
                 history_load_btn = gr.Button("Load", scale=1)
             history_report = gr.Markdown()
 
-            history_refresh_btn.click(
-                fn=load_seo_history, inputs=session_state, outputs=history_df,
-            )
-            history_load_btn.click(
-                fn=load_seo_report, inputs=[history_id_input, session_state], outputs=history_report,
-            )
+            history_refresh_btn.click(fn=load_seo_history, inputs=session_state, outputs=history_df)
+            history_load_btn.click(fn=load_seo_report, inputs=[history_id_input, session_state], outputs=history_report)
 
     gr.Markdown(
         "---\n"
