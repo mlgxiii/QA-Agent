@@ -151,6 +151,75 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
     {
+        "name": "extract_ai_citable_content",
+        "description": (
+            "Simulates what an AI search engine (Perplexity, ChatGPT, Google AI Overviews) "
+            "would extract and cite from this content. "
+            "Returns: the likely opening citation, top citable statistics, definition sentences, "
+            "FAQ answer extracts, coverage gaps that reduce citation probability, "
+            "and a structured AI answer preview the agent can present to the user."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Full plain-text body content."},
+                "headings": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "All heading texts H1–H6.",
+                },
+                "first_paragraph": {"type": "string", "description": "First body paragraph."},
+                "title": {"type": "string", "description": "Page title."},
+                "target_keywords": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Target keywords to check coverage for.",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "compare_content_gap",
+        "description": (
+            "Compares a target page against a competitor page to identify content gaps. "
+            "Finds headings and topics the competitor covers that the target page is missing, "
+            "compares word counts and GEO signal presence, and returns ranked gap recommendations."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_title": {"type": "string"},
+                "target_headings": {"type": "array", "items": {"type": "string"}},
+                "target_text": {"type": "string"},
+                "competitor_title": {"type": "string"},
+                "competitor_headings": {"type": "array", "items": {"type": "string"}},
+                "competitor_text": {"type": "string"},
+                "competitor_url": {"type": "string", "description": "Competitor URL for labelling."},
+            },
+            "required": ["target_headings", "target_text", "competitor_headings", "competitor_text"],
+        },
+    },
+    {
+        "name": "extract_faq_opportunities",
+        "description": (
+            "Scans content to extract existing Q&A pairs and identify new FAQ opportunities. "
+            "Returns: existing answerable questions found in headings, suggested new questions "
+            "the content could answer, and ready-to-paste FAQ HTML + FAQPage JSON-LD schema. "
+            "Use this to generate the FAQ section that C-SEO Bench identified as the top "
+            "structural signal for AI citation."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Plain text body content."},
+                "headings": {"type": "array", "items": {"type": "string"}},
+                "title": {"type": "string"},
+                "keywords": {"type": "array", "items": {"type": "string"}},
+                "page_url": {"type": "string", "description": "Page URL for schema markup."},
+            },
+            "required": ["text"],
+        },
+    },
+    {
         "name": "write_seo_report",
         "description": (
             "Save the final SEO/GEO analysis report as a Markdown file. "
@@ -196,6 +265,32 @@ def execute_tool(name: str, inputs: dict[str, Any]) -> str:
                     structured_data=inputs.get("structured_data", []),
                     first_paragraph=inputs.get("first_paragraph", ""),
                     title=inputs.get("title", ""),
+                )
+            case "extract_ai_citable_content":
+                return _extract_ai_citable_content(
+                    inputs["text"],
+                    headings=inputs.get("headings", []),
+                    first_paragraph=inputs.get("first_paragraph", ""),
+                    title=inputs.get("title", ""),
+                    target_keywords=inputs.get("target_keywords", []),
+                )
+            case "compare_content_gap":
+                return _compare_content_gap(
+                    target_title=inputs.get("target_title", ""),
+                    target_headings=inputs.get("target_headings", []),
+                    target_text=inputs["target_text"],
+                    competitor_title=inputs.get("competitor_title", ""),
+                    competitor_headings=inputs.get("competitor_headings", []),
+                    competitor_text=inputs["competitor_text"],
+                    competitor_url=inputs.get("competitor_url", ""),
+                )
+            case "extract_faq_opportunities":
+                return _extract_faq_opportunities(
+                    inputs["text"],
+                    headings=inputs.get("headings", []),
+                    title=inputs.get("title", ""),
+                    keywords=inputs.get("keywords", []),
+                    page_url=inputs.get("page_url", ""),
                 )
             case "write_seo_report":
                 return _write_report(inputs["content"], inputs["output_path"])
@@ -856,6 +951,326 @@ def _score_geo_signals(
         "score_parts": {k: round(v, 1) for k, v in score_parts.items()},
         "ranked_actions": actions,
     }, indent=2)
+
+
+def _extract_ai_citable_content(
+    text: str,
+    headings: list[str] | None = None,
+    first_paragraph: str = "",
+    title: str = "",
+    target_keywords: list[str] | None = None,
+) -> str:
+    headings = headings or []
+    target_keywords = target_keywords or []
+    all_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.split()) >= 5]
+
+    # Opening extract — first 1-2 sentences (highest AI extraction probability)
+    opening_sentences = all_sentences[:2]
+
+    # Definition sentences — "X is/means/refers to Y"
+    definition_pattern = re.compile(
+        r"[A-Z][^.!?]{10,120}(?:is|are|means|refers to|defined as|describes)[^.!?]{5,100}[.!?]",
+        re.IGNORECASE,
+    )
+    definitions = [m.group(0).strip() for m in definition_pattern.finditer(text)][:5]
+
+    # Statistics in context — stat + surrounding sentence
+    stat_re = re.compile(
+        r"\b\d+(?:\.\d+)?%|\$[\d,]+(?:\.\d+)?[KMBkmb]?|\b\d+(?:\.\d+)?[x×] "
+        r"|\b\d{1,3}(?:,\d{3})+|\b\d+ (?:million|billion|trillion|thousand)\b"
+    )
+    stat_sentences = []
+    for s in all_sentences:
+        if stat_re.search(s) and 8 <= len(s.split()) <= 35:
+            stat_sentences.append(s)
+    stat_sentences = stat_sentences[:8]
+
+    # FAQ extracts — first sentence under each question-formatted heading
+    faq_extracts = []
+    paragraphs = [p.strip() for p in re.split(r"\n\n+", text) if p.strip()]
+    for h in headings:
+        if re.match(r"(?i)^(what|how|why|when|who|where|which|can|does|is|are|will|should)\b", h):
+            # Find paragraph that follows this heading (heuristic: find text after heading)
+            heading_lower = h.lower()
+            for i, para in enumerate(paragraphs):
+                if heading_lower in para.lower() and i + 1 < len(paragraphs):
+                    answer_para = paragraphs[i + 1]
+                    first_answer_sentence = re.split(r"(?<=[.!?])\s+", answer_para)[0]
+                    faq_extracts.append({"question": h, "likely_cited_answer": first_answer_sentence})
+                    break
+    faq_extracts = faq_extracts[:6]
+
+    # Quotable units — 10-25 words, self-contained, with a verb, no pronoun opener
+    quotable = []
+    for s in all_sentences:
+        wc = len(s.split())
+        has_verb = bool(re.search(
+            r"\b(?:is|are|was|were|has|have|had|can|will|does|do|provide|show|"
+            r"increase|reduce|improve|enable|allow|result|help|make|give|find)\b", s.lower()
+        ))
+        starts_with_ref = bool(re.match(r"^(?:This|That|These|Those|It|They|He|She|We)\b", s))
+        if 10 <= wc <= 25 and has_verb and not starts_with_ref:
+            quotable.append(s)
+    quotable = quotable[:8]
+
+    # Coverage gaps — signals absent that reduce citation probability
+    gaps = []
+    if not definitions:
+        gaps.append("No definition sentence — AI cannot easily define the topic from this content")
+    if not stat_sentences:
+        gaps.append("No statistics — claims are unverifiable, reducing citation confidence")
+    attribution_count = len(re.findall(
+        r"(?:according to|found by|reported by|study by|research from|data from)", text.lower()
+    ))
+    if attribution_count == 0:
+        gaps.append("No named attribution — anonymous claims are cited less than sourced claims")
+    if not faq_extracts:
+        gaps.append("No question-formatted headings — FAQ structure is missing (top C-SEO Bench signal)")
+    if not first_paragraph or len(first_paragraph.split()) > 80:
+        gaps.append("Opening paragraph too long or absent — AI truncates long openers")
+    keyword_gaps = [kw for kw in target_keywords if kw.lower() not in text.lower()]
+    if keyword_gaps:
+        gaps.append(f"Target keywords missing from content: {', '.join(keyword_gaps)}")
+
+    return json.dumps({
+        "ai_answer_preview": {
+            "likely_opening_citation": opening_sentences,
+            "likely_cited_definitions": definitions,
+            "likely_cited_statistics": stat_sentences,
+            "likely_cited_faq_answers": faq_extracts,
+            "top_quotable_units": quotable,
+        },
+        "coverage_gaps": gaps,
+        "total_citable_units": len(definitions) + len(stat_sentences) + len(quotable) + len(faq_extracts),
+        "citability_verdict": (
+            "High" if len(gaps) <= 1 else
+            "Medium" if len(gaps) <= 3 else
+            "Low"
+        ),
+    }, indent=2, ensure_ascii=False)
+
+
+def _compare_content_gap(
+    target_title: str,
+    target_headings: list[str],
+    target_text: str,
+    competitor_title: str,
+    competitor_headings: list[str],
+    competitor_text: str,
+    competitor_url: str = "",
+) -> str:
+    target_words = len(target_text.split())
+    competitor_words = len(competitor_text.split())
+
+    # Normalise headings for fuzzy comparison
+    def _normalise(h: str) -> str:
+        return re.sub(r"[^a-z0-9 ]", "", h.lower()).strip()
+
+    target_normalised = {_normalise(h) for h in target_headings}
+    competitor_normalised = {_normalise(h): h for h in competitor_headings}
+
+    # Headings in competitor not in target (content gaps)
+    heading_gaps = [
+        orig for norm, orig in competitor_normalised.items()
+        if norm not in target_normalised
+        and len(norm) > 4  # skip trivially short headings
+    ]
+
+    # Topic keyword extraction — simple: significant words in headings
+    def _topic_words(headings: list[str]) -> set[str]:
+        stopwords = {"a","an","the","is","are","to","of","in","on","for","and","or","with","by","at"}
+        words = set()
+        for h in headings:
+            for w in re.findall(r"\b[a-z]{4,}\b", h.lower()):
+                if w not in stopwords:
+                    words.add(w)
+        return words
+
+    target_topics = _topic_words(target_headings)
+    competitor_topics = _topic_words(competitor_headings)
+    missing_topics = sorted(competitor_topics - target_topics)
+    shared_topics = sorted(target_topics & competitor_topics)
+
+    # GEO quick-score for both (count key signals)
+    def _quick_geo(text: str, headings: list[str]) -> dict:
+        stat_re = re.compile(r"\b\d+(?:\.\d+)?%|\$[\d,]+|\b\d+ (?:million|billion|thousand)\b")
+        attr_re = re.compile(r"according to|study by|research from|reported by", re.I)
+        q_headings = sum(1 for h in headings if re.match(r"(?i)^(what|how|why|when|who|where|which|can|does|is|are)\b", h))
+        return {
+            "word_count": len(text.split()),
+            "statistics_count": len(stat_re.findall(text)),
+            "attribution_count": len(attr_re.findall(text)),
+            "question_headings": q_headings,
+            "heading_count": len(headings),
+        }
+
+    target_geo = _quick_geo(target_text, target_headings)
+    competitor_geo = _quick_geo(competitor_text, competitor_headings)
+
+    # Ranked recommendations
+    recommendations = []
+    if heading_gaps:
+        recommendations.append({
+            "priority": 1,
+            "action": f"Cover {len(heading_gaps)} topics the competitor addresses that you don't",
+            "topics": heading_gaps[:8],
+        })
+    if competitor_geo["word_count"] > target_words * 1.3:
+        deficit = competitor_geo["word_count"] - target_words
+        recommendations.append({
+            "priority": 2,
+            "action": f"Expand content by ~{deficit} words to match competitor depth",
+            "detail": f"Target: {target_words} words | Competitor: {competitor_geo['word_count']} words",
+        })
+    if competitor_geo["statistics_count"] > target_geo["statistics_count"]:
+        recommendations.append({
+            "priority": 3,
+            "action": f"Add {competitor_geo['statistics_count'] - target_geo['statistics_count']} more statistics",
+            "detail": f"You: {target_geo['statistics_count']} | Competitor: {competitor_geo['statistics_count']}",
+        })
+    if competitor_geo["question_headings"] > target_geo["question_headings"]:
+        recommendations.append({
+            "priority": 4,
+            "action": f"Add {competitor_geo['question_headings'] - target_geo['question_headings']} more question-formatted headings",
+            "detail": f"You: {target_geo['question_headings']} | Competitor: {competitor_geo['question_headings']}",
+        })
+
+    return json.dumps({
+        "competitor_url": competitor_url,
+        "heading_gaps": heading_gaps,
+        "missing_topic_keywords": missing_topics[:20],
+        "shared_topic_keywords": shared_topics[:10],
+        "signal_comparison": {
+            "target": target_geo,
+            "competitor": competitor_geo,
+        },
+        "content_gap_score": round(len(heading_gaps) / max(len(competitor_headings), 1) * 100),
+        "ranked_recommendations": recommendations,
+    }, indent=2, ensure_ascii=False)
+
+
+def _extract_faq_opportunities(
+    text: str,
+    headings: list[str] | None = None,
+    title: str = "",
+    keywords: list[str] | None = None,
+    page_url: str = "",
+) -> str:
+    headings = headings or []
+    keywords = keywords or []
+    text_lower = text.lower()
+
+    # Existing Q&A pairs — question headings with answer paragraphs
+    existing_qa: list[dict] = []
+    paragraphs = [p.strip() for p in re.split(r"\n\n+", text) if p.strip()]
+    for h in headings:
+        if re.match(r"(?i)^(what|how|why|when|who|where|which|can|does|is|are|will|should)\b", h) or "?" in h:
+            # Best-effort: grab first substantive sentence from text near heading
+            heading_lower = h.lower()
+            answer = ""
+            for i, para in enumerate(paragraphs):
+                if heading_lower[:20] in para.lower() and i + 1 < len(paragraphs):
+                    sentences = re.split(r"(?<=[.!?])\s+", paragraphs[i + 1])
+                    answer = sentences[0].strip() if sentences else ""
+                    break
+            if not answer and paragraphs:
+                # fallback: search all paragraphs for overlap
+                for para in paragraphs:
+                    words_in_common = set(heading_lower.split()) & set(para.lower().split())
+                    if len(words_in_common) >= 2:
+                        sentences = re.split(r"(?<=[.!?])\s+", para)
+                        answer = sentences[0].strip() if sentences else ""
+                        break
+            existing_qa.append({
+                "question": h if h.endswith("?") else h + "?",
+                "answer_first_sentence": answer[:200] if answer else "(answer not found in content)",
+                "status": "existing_heading",
+            })
+
+    # Implicit Q&A from definition sentences
+    def_pattern = re.compile(
+        r"([A-Z][^.!?]{5,60})\s+(?:is|are|means|refers to|defined as)\s+([^.!?]{10,120})[.!?]"
+    )
+    for m in def_pattern.finditer(text):
+        subject = m.group(1).strip()
+        if 2 <= len(subject.split()) <= 8:
+            existing_qa.append({
+                "question": f"What is {subject}?",
+                "answer_first_sentence": m.group(0).strip(),
+                "status": "derived_from_definition",
+            })
+    existing_qa = existing_qa[:10]
+
+    # Suggested new questions — based on keywords + common intent patterns
+    question_templates = [
+        "What is {kw}?",
+        "How does {kw} work?",
+        "Why is {kw} important?",
+        "What are the benefits of {kw}?",
+        "How do you improve {kw}?",
+        "What is the difference between {kw} and alternatives?",
+        "How long does {kw} take?",
+        "What are common mistakes with {kw}?",
+    ]
+    suggested = []
+    kw_sources = keywords if keywords else ([title] if title else [])
+    for kw in kw_sources[:3]:
+        for template in question_templates[:4]:
+            q = template.format(kw=kw)
+            # Only suggest if not already effectively covered
+            if not any(q.lower()[:20] in eq["question"].lower() for eq in existing_qa):
+                suggested.append(q)
+    suggested = suggested[:8]
+
+    # Generate FAQ HTML
+    all_qa = existing_qa[:6]
+    faq_items_html = []
+    for qa in all_qa:
+        q = qa["question"]
+        a = qa["answer_first_sentence"]
+        faq_items_html.append(
+            f'  <div class="faq-item">\n'
+            f'    <h3>{q}</h3>\n'
+            f'    <p>{a}</p>\n'
+            f'  </div>'
+        )
+    faq_html = (
+        '<section class="faq">\n'
+        '  <h2>Frequently Asked Questions</h2>\n'
+        + "\n".join(faq_items_html)
+        + "\n</section>"
+    )
+
+    # Generate FAQPage JSON-LD
+    schema_entities = []
+    for qa in all_qa:
+        schema_entities.append({
+            "@type": "Question",
+            "name": qa["question"],
+            "acceptedAnswer": {
+                "@type": "Answer",
+                "text": qa["answer_first_sentence"],
+            },
+        })
+    faq_schema = {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": schema_entities,
+    }
+    if page_url:
+        faq_schema["url"] = page_url
+
+    return json.dumps({
+        "existing_qa_pairs": existing_qa,
+        "suggested_new_questions": suggested,
+        "qa_pairs_total": len(existing_qa),
+        "faq_section_html": faq_html,
+        "faq_schema_json_ld": json.dumps(faq_schema, indent=2),
+        "next_step": (
+            "Paste faq_section_html into your page before the closing </article> tag, "
+            "and faq_schema_json_ld into a <script type='application/ld+json'> tag in <head>."
+        ),
+    }, indent=2, ensure_ascii=False)
 
 
 def _write_report(content: str, output_path: str) -> str:

@@ -31,6 +31,20 @@ def init_db() -> None:
                 "ALTER TABLE analyses ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
             )
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS seo_analyses (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT    NOT NULL DEFAULT '',
+                source     TEXT    NOT NULL,
+                mode       TEXT    NOT NULL DEFAULT 'analyze',
+                timestamp  TEXT    NOT NULL,
+                duration_s REAL,
+                seo_score  INTEGER,
+                geo_score  INTEGER,
+                report_md  TEXT
+            )
+        """)
+
 
 def save_analysis(
     source: str, report_md: str, duration_s: float, session_id: str = ""
@@ -75,10 +89,77 @@ def get_report(analysis_id: int, session_id: str = "") -> str:
     return row["report_md"] if row else "Report not found."
 
 
+def save_seo_analysis(
+    source: str,
+    report_md: str,
+    duration_s: float,
+    mode: str = "analyze",
+    session_id: str = "",
+) -> int:
+    seo_score, geo_score = _extract_seo_scores(report_md)
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO seo_analyses "
+            "(session_id, source, mode, timestamp, duration_s, seo_score, geo_score, report_md) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                session_id,
+                source,
+                mode,
+                datetime.utcnow().isoformat(timespec="seconds"),
+                round(duration_s),
+                seo_score,
+                geo_score,
+                report_md,
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_seo_history(session_id: str = "") -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, source, mode, timestamp, duration_s, seo_score, geo_score "
+            "FROM seo_analyses WHERE session_id = ? ORDER BY timestamp DESC LIMIT 100",
+            (session_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_seo_report(analysis_id: int, session_id: str = "") -> str:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT report_md FROM seo_analyses WHERE id = ? AND session_id = ?",
+            (analysis_id, session_id),
+        ).fetchone()
+    return row["report_md"] if row else "Report not found."
+
+
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _extract_seo_scores(report_md: str) -> tuple[int | None, int | None]:
+    """Pull SEO and GEO scores from a report markdown string."""
+    seo = geo = None
+    m = re.search(r"SEO[^|]*\|\s*(\d+)/100", report_md, re.IGNORECASE)
+    if m:
+        seo = int(m.group(1))
+    m = re.search(r"GEO[^|]*\|\s*(\d+)/100", report_md, re.IGNORECASE)
+    if m:
+        geo = int(m.group(1))
+    # Fallback patterns
+    if seo is None:
+        m = re.search(r"SEO Score[:\s]+(\d+)", report_md, re.IGNORECASE)
+        if m:
+            seo = int(m.group(1))
+    if geo is None:
+        m = re.search(r"GEO Score[:\s]+(\d+)", report_md, re.IGNORECASE)
+        if m:
+            geo = int(m.group(1))
+    return seo, geo
 
 
 def _count_severity(report_md: str) -> dict:

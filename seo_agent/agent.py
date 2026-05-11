@@ -16,12 +16,14 @@ ANTHROPIC_MODELS = {
 
 class SEOGEOAgent:
     """
-    SEO + GEO (Generative Engine Optimization) analysis and rewriting agent.
+    SEO + GEO Optimizer agent.
 
-    Powered by Claude with extended thinking, tool use, and prompt caching.
-    Two modes:
-      - 'analyze': audit a URL or content for SEO/GEO issues and opportunities
-      - 'rewrite': return an optimised rewrite of the content
+    Modes:
+      analyze  — full scored audit of a URL or content
+      rewrite  — optimised content rewrite + meta tags + schema
+      both     — audit + rewrite in one run
+      brief    — content brief for a keyword (new content creation)
+      gap      — competitor content gap analysis (requires competitor_urls)
     """
 
     DEFAULT_MODEL = "claude-opus-4-7"
@@ -38,22 +40,12 @@ class SEOGEOAgent:
         target_keywords: list[str] | None = None,
         competitor_urls: list[str] | None = None,
         mode: str = "analyze",
+        audience: str = "",
         output_report: Optional[str] = None,
         verbose: bool = False,
     ) -> None:
-        """
-        Run the SEO/GEO agent.
-
-        Args:
-            content:          URL (https://...) or raw text/HTML content.
-            target_keywords:  List of target keywords to optimise for.
-            competitor_urls:  Optional competitor URLs to benchmark against.
-            mode:             'analyze' | 'rewrite' | 'both'
-            output_report:    If given, saves the report to this path.
-            verbose:          Print Claude's thinking blocks.
-        """
         user_message = self._build_user_message(
-            content, target_keywords, competitor_urls, mode, output_report
+            content, target_keywords, competitor_urls, mode, audience, output_report
         )
         messages: list[dict] = [{"role": "user", "content": user_message}]
 
@@ -73,7 +65,7 @@ class SEOGEOAgent:
             messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason == "end_turn":
-                print("\n\n✅  Analysis complete!")
+                print("\n\n✅  Done!")
                 self._print_stats(response, total_tool_calls)
                 break
 
@@ -89,84 +81,231 @@ class SEOGEOAgent:
                 print(f"\n⚠️  Unexpected stop_reason: {response.stop_reason!r}")
                 break
 
+    # ------------------------------------------------------------------
+    # Message builders per mode
+    # ------------------------------------------------------------------
+
     def _build_user_message(
         self,
         content: str,
         target_keywords: list[str] | None,
         competitor_urls: list[str] | None,
         mode: str,
+        audience: str,
         output_report: Optional[str],
     ) -> str:
-        is_url = content.strip().startswith(("http://", "https://"))
-
-        kw_section = ""
-        if target_keywords:
-            kw_section = f"\n**Target keywords:** {', '.join(target_keywords)}"
-
-        competitor_section = ""
-        if competitor_urls:
-            urls = "\n".join(f"- {u}" for u in competitor_urls)
-            competitor_section = (
-                f"\n\n**Competitor URLs to benchmark against:**\n{urls}\n"
-                "Fetch each competitor and compare their SEO/GEO signals to the target."
-            )
-
-        if mode == "rewrite":
-            task = (
-                "Produce an optimised **rewrite** of the page content. "
-                "Return: (1) the full rewritten body content, "
-                "(2) an optimised title tag, "
-                "(3) an optimised meta description, "
-                "(4) recommended JSON-LD schema markup. "
-                "Show the original versus new value for every changed element."
-            )
-        elif mode == "both":
-            task = (
-                "First produce a full SEO/GEO analysis report, then produce an optimised "
-                "rewrite of the content with improved meta tags and schema markup."
-            )
-        else:
-            task = (
-                "Produce a comprehensive SEO/GEO analysis report with scoring, "
-                "prioritised recommendations, optimised meta tags, and suggested schema markup."
-            )
-
         report_note = (
             f"Save the final report using `write_seo_report` to: {output_report}"
             if output_report
             else "Present the complete report in your final response."
         )
 
+        if mode == "brief":
+            return self._brief_message(content, target_keywords, competitor_urls, audience, report_note)
+        if mode == "gap":
+            return self._gap_message(content, target_keywords, competitor_urls, report_note)
+        return self._analyze_message(content, target_keywords, competitor_urls, mode, report_note)
+
+    def _analyze_message(
+        self,
+        content: str,
+        target_keywords: list[str] | None,
+        competitor_urls: list[str] | None,
+        mode: str,
+        report_note: str,
+    ) -> str:
+        is_url = content.strip().startswith(("http://", "https://"))
+        kw_line = f"\n**Target keywords:** {', '.join(target_keywords)}" if target_keywords else ""
+
+        competitor_section = ""
+        if competitor_urls:
+            urls = "\n".join(f"- {u}" for u in competitor_urls)
+            competitor_section = (
+                f"\n\n**Competitor URLs:**\n{urls}\n"
+                "After analysing the target, fetch each competitor, extract their page data, "
+                "run `compare_content_gap` to identify gaps, and include findings in the report."
+            )
+
+        if mode == "rewrite":
+            task = (
+                "Produce an optimised **rewrite** of the page content. "
+                "Return: (1) rewritten body content with all GEO signals applied, "
+                "(2) optimised title tag (current → new), "
+                "(3) optimised meta description (current → new), "
+                "(4) JSON-LD schema. Show original vs new for every change."
+            )
+        elif mode == "both":
+            task = (
+                "Produce a full SEO/GEO analysis report, then an optimised rewrite "
+                "with improved meta tags and schema markup."
+            )
+        else:
+            task = (
+                "Produce a comprehensive SEO/GEO analysis report with scores, "
+                "prioritised recommendations, AI answer preview, FAQ opportunities, "
+                "optimised meta tags, and schema markup."
+            )
+
         if is_url:
             input_section = (
-                f"**URL to analyse:** {content.strip()}\n\n"
-                "Use `fetch_url` to retrieve the page, then `extract_page_data` to parse it."
+                f"**URL:** {content.strip()}\n\n"
+                "Use `fetch_url` → `extract_page_data` to retrieve the page."
             )
         else:
             input_section = (
-                "**Content to analyse (raw text/HTML provided):**\n\n"
-                f"{content[:8000]}"
-                + ("\n\n[... content truncated for brevity ...]" if len(content) > 8000 else "")
+                "**Content provided (raw text/HTML):**\n\n"
+                + content[:8000]
+                + ("\n\n[... truncated ...]" if len(content) > 8000 else "")
             )
 
         return f"""{input_section}
-{kw_section}
+{kw_line}
 {competitor_section}
 
 **Task:** {task}
 
-**Analysis steps:**
-1. {'Fetch the URL and extract page data.' if is_url else 'Extract page data from the provided content.'}
-2. Run `analyze_readability` on the body text.
-3. Run `analyze_keyword_density` for each target keyword.
-4. Run `score_geo_signals` to evaluate AI citation readiness.
-5. {'Fetch and compare competitor pages.' if competitor_urls else 'Skip competitor comparison (none provided).'}
-6. Synthesise all findings into the structured report.
+**Steps:**
+1. {'Fetch URL + extract page data.' if is_url else 'Extract page data from provided content.'}
+2. `analyze_readability` on body text.
+3. `analyze_keyword_density` for each target keyword.
+4. `score_geo_signals` — full research-backed GEO audit.
+5. `extract_ai_citable_content` — simulate what AI engines would cite.
+6. `extract_faq_opportunities` — generate ready-to-paste FAQ section + schema.
+7. {'Fetch competitors + `compare_content_gap` for each.' if competitor_urls else 'No competitors provided.'}
+8. Synthesise all findings. {report_note}
+
+Show **current value → recommended value** for every finding. Always cite exact text.
+"""
+
+    def _gap_message(
+        self,
+        content: str,
+        target_keywords: list[str] | None,
+        competitor_urls: list[str] | None,
+        report_note: str,
+    ) -> str:
+        if not competitor_urls:
+            return (
+                "Error: gap mode requires at least one competitor URL. "
+                "Please provide competitor_urls."
+            )
+        kw_line = f"\n**Target keywords:** {', '.join(target_keywords)}" if target_keywords else ""
+        comp_list = "\n".join(f"- {u}" for u in competitor_urls)
+        is_url = content.strip().startswith(("http://", "https://"))
+
+        return f"""**Competitor Content Gap Analysis**
+
+**Target:** {content.strip()}
+{kw_line}
+
+**Competitors to benchmark against:**
+{comp_list}
+
+**Steps:**
+1. {'Fetch target URL + `extract_page_data`.' if is_url else 'Extract page data from provided content.'}
+2. For each competitor: `fetch_url` + `extract_page_data`.
+3. Run `score_geo_signals` on target AND each competitor.
+4. Run `compare_content_gap` for each target vs. competitor pair.
+5. Run `extract_ai_citable_content` on target to show citability gaps.
+6. Produce a structured gap report:
+   - Side-by-side GEO signal comparison table
+   - Ranked list of heading/topic gaps (competitor covers, target doesn't)
+   - Word count comparison with target
+   - Top 10 specific additions to make the target outperform all competitors
+   - Ready-to-add headings + FAQ questions to fill the gaps
+7. {report_note}
+"""
+
+    def _brief_message(
+        self,
+        keyword: str,
+        target_keywords: list[str] | None,
+        competitor_urls: list[str] | None,
+        audience: str,
+        report_note: str,
+    ) -> str:
+        related_kws = ", ".join(target_keywords) if target_keywords else "none provided"
+        comp_list = "\n".join(f"- {u}" for u in competitor_urls) if competitor_urls else "none provided"
+        audience_line = f"\n**Target audience:** {audience}" if audience else ""
+
+        return f"""**Content Brief Request**
+
+**Primary keyword / topic:** {keyword}
+**Related keywords:** {related_kws}{audience_line}
+
+**Competitor URLs to analyse for benchmarking:**
+{comp_list}
+
+**Steps:**
+1. If competitor URLs provided: `fetch_url` + `extract_page_data` for each.
+2. Run `score_geo_signals` on each competitor to understand the GEO bar to beat.
+3. Run `extract_faq_opportunities` on competitor content to surface questions to answer.
+4. Run `compare_content_gap` across competitors to identify topic coverage patterns.
+5. Synthesise into a complete content brief (format below).
+
+**Output — Content Brief format:**
+
+```
+# Content Brief: [keyword]
+
+## Target Audience
+[who this is for, their intent, knowledge level]
+
+## Search Intent
+[informational / commercial / transactional — and why]
+
+## Recommended Title Tag (≤60 chars)
+[title]
+
+## Recommended Meta Description (≤160 chars)
+[description]
+
+## Recommended URL Slug
+[slug]
+
+## Target Word Count
+[range — based on competitor analysis or 1200–2000 if no competitors]
+
+## Content Outline
+### H1: [question-formatted title]
+### H2: [section 1 — answer the core question directly]
+  - Key point to cover
+  - Statistic to find and include
+### H2: [section 2]
+  ...
+### H2: Frequently Asked Questions
+  - Q: [question 1]
+  - Q: [question 2]
+  ...
+
+## Statistics & Data to Find
+[5–8 specific data points to research and include, with suggested source types]
+
+## Attribution Targets
+[3–5 types of named sources to cite: industry reports, institutions, studies]
+
+## E-E-A-T Signals to Include
+[specific credibility elements: author bio, methodology, date, primary sources]
+
+## Schema Markup to Add
+[recommended types with brief rationale]
+
+## GEO Optimisation Checklist
+- [ ] Direct answer in first 80 words
+- [ ] ≥3 statistics per 500 words
+- [ ] ≥3 named-source attributions
+- [ ] ≥8 quotable sentences (10–25 words)
+- [ ] ≥5 question-formatted H2/H3 headings
+- [ ] FAQ section with FAQPage schema
+- [ ] Article schema with datePublished + author
+```
 
 {report_note}
-
-Be specific — always show **current value → recommended value**. Cite exact text that needs changing.
 """
+
+    # ------------------------------------------------------------------
+    # Core engine (shared across all modes)
+    # ------------------------------------------------------------------
 
     def _run_turn(
         self,
