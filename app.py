@@ -79,19 +79,13 @@ def chat_with_report(message: str, history: list, report: str, api_key: str, mod
     api_key = api_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
 
     if not api_key:
-        history = history + [
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": "❌ API key required — enter it in the Analyser tab."},
-        ]
-        yield history, history
+        yield history + [[message, "❌ API key required — enter it in the Analyser tab."]], \
+              history + [[message, "❌ API key required — enter it in the Analyser tab."]]
         return
 
     if not report or not report.strip():
-        history = history + [
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": "No report loaded yet. Run an analysis first, then ask me anything about it."},
-        ]
-        yield history, history
+        yield history + [[message, "No report loaded yet. Run an analysis first, then ask me anything about it."]], \
+              history + [[message, "No report loaded yet. Run an analysis first, then ask me anything about it."]]
         return
 
     system = f"""You are an expert SEO and GEO (Generative Engine Optimization) consultant. \
@@ -107,14 +101,15 @@ If asked why a score is what it is, explain the exact signals that drove it.
 {report[:15000]}
 --- REPORT END ---"""
 
-    # Build message list from history
-    messages = [{"role": h["role"], "content": h["content"]} for h in history]
+    # Build message list from tuple history [[user, bot], ...]
+    messages = []
+    for user_msg, bot_msg in history:
+        messages.append({"role": "user", "content": user_msg})
+        if bot_msg:
+            messages.append({"role": "assistant", "content": bot_msg})
     messages.append({"role": "user", "content": message})
 
-    history = history + [
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": ""},
-    ]
+    history = history + [[message, ""]]
 
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -125,7 +120,7 @@ If asked why a score is what it is, explain the exact signals that drove it.
         messages=messages,
     ) as stream:
         for text in stream.text_stream:
-            history[-1]["content"] += text
+            history[-1][1] += text
             yield history, history
 
 
@@ -350,7 +345,7 @@ def load_seo_report(analysis_id, session_id: str = "") -> str:
 # Gradio UI
 # ---------------------------------------------------------------------------
 
-with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="SEO / GEO Optimizer") as demo:
 
     session_state = gr.State(value="")
 
@@ -434,12 +429,7 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
                 "*\"Why is my GEO score low?\", \"Rewrite the introduction\", "
                 "\"Which recommendation should I do first?\", \"Explain the FAQ score\"*"
             )
-            analyser_chatbot = gr.Chatbot(
-                label="Report chat",
-                type="messages",
-                height=400,
-                show_copy_button=True,
-            )
+            analyser_chatbot = gr.Chatbot(label="Report chat", height=400)
             analyser_chat_state = gr.State(value=[])
             with gr.Row():
                 analyser_chat_input = gr.Textbox(
@@ -544,12 +534,7 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
                 "*\"Add more FAQ questions about pricing\", \"Make the outline longer\", "
                 "\"Change the target audience to developers\", \"What statistics should I find first?\"*"
             )
-            brief_chatbot = gr.Chatbot(
-                label="Brief chat",
-                type="messages",
-                height=400,
-                show_copy_button=True,
-            )
+            brief_chatbot = gr.Chatbot(label="Brief chat", height=400)
             brief_chat_state = gr.State(value=[])
             with gr.Row():
                 brief_chat_input = gr.Textbox(
@@ -628,4 +613,4 @@ with gr.Blocks(title="SEO / GEO Optimizer", theme=gr.themes.Soft()) as demo:
 
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(theme=gr.themes.Soft())
