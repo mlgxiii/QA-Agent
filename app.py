@@ -24,6 +24,7 @@ import gradio as gr
 
 import db
 from qa_agent.agent import ANTHROPIC_MODELS
+from qa_agent.saas_agent import PRESET_CATEGORIES
 
 try:
     from qa_agent.agent_openai import OPENAI_MODELS
@@ -310,102 +311,270 @@ def load_report(analysis_id, session_id: str = "") -> str:
     return db.get_report(int(analysis_id), session_id or "")
 
 
+_SAAS_CATEGORY_CHOICES = list(PRESET_CATEGORIES.keys())
+
+
+def run_saas_discovery(
+    categories: list[str],
+    custom_query: str,
+    model: str,
+    anthropic_key: str,
+    gh_token: str,
+    verbose: bool,
+):
+    gh_token = gh_token.strip() or os.environ.get("GITHUB_TOKEN", "")
+    api_key = anthropic_key.strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    if not api_key:
+        yield "❌ Anthropic API key is required.", ""
+        return
+
+    if not categories and not custom_query.strip():
+        yield "❌ Select at least one category or enter a custom query.", ""
+        return
+
+    report_file = tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w")
+    report_path = report_file.name
+    report_file.close()
+
+    cmd = [
+        sys.executable, "-m", "qa_agent.saas_cli",
+        "--output", report_path,
+        "--model", model,
+    ]
+    for cat in categories:
+        cmd += ["--categories", cat]
+    if custom_query.strip():
+        cmd += ["--custom-query", custom_query.strip()]
+    if verbose:
+        cmd.append("--verbose")
+
+    env = os.environ.copy()
+    env["ANTHROPIC_API_KEY"] = api_key
+    env["GITHUB_TOKEN"] = gh_token
+
+    log = ""
+    start = time.time()
+    timed_out = False
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            cwd=str(Path(__file__).parent),
+        )
+
+        def _kill_on_timeout():
+            nonlocal timed_out
+            try:
+                process.wait(timeout=_ANALYSIS_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.kill()
+
+        watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+        watchdog.start()
+
+        for line in process.stdout:
+            log += line
+            log = _tail_log(log)
+            yield log, ""
+
+        process.wait()
+        watchdog.join(timeout=1)
+
+        if timed_out:
+            log += f"\n⏱️  Discovery timed out after {_ANALYSIS_TIMEOUT // 60} minutes.\n"
+            yield log, ""
+            return
+
+        report = ""
+        if Path(report_path).exists():
+            report = Path(report_path).read_text(encoding="utf-8")
+
+        yield log, report
+    finally:
+        try:
+            os.unlink(report_path)
+        except OSError:
+            pass
+
+
 with gr.Blocks(title="Scalability QA Agent") as demo:
     session_state = gr.State(value="")
-    gr.Markdown("# Production Scalability QA Agent")
-    gr.Markdown(
-        "Analyse any codebase for production scalability issues using Claude or GPT-4o. "
-        "Paste a GitHub URL **or** a local folder path."
-    )
-
-    with gr.Row():
-        github_input = gr.Textbox(
-            label="GitHub repo URL",
-            placeholder="https://github.com/owner/repo",
-            scale=3,
-        )
-        model_dropdown = gr.Dropdown(
-            label="Model",
-            choices=_ALL_MODELS,
-            value=_DEFAULT_MODEL,
-            scale=2,
-        )
-
-    with gr.Row():
-        api_key_input = gr.Textbox(
-            label="Anthropic API key",
-            placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
-            type="password",
-            scale=2,
-            visible=True,
-        )
-        openai_key_input = gr.Textbox(
-            label="OpenAI API key",
-            placeholder="sk-…  (or set OPENAI_API_KEY env var)",
-            type="password",
-            scale=2,
-            visible=False,
-        )
-        gh_token_input = gr.Textbox(
-            label="GitHub token (optional — required for private repos)",
-            placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
-            type="password",
-            scale=2,
-        )
-
-    local_input = gr.Textbox(
-        label="— or — local path",
-        placeholder="/path/to/your/project  (leave blank if using GitHub URL above)",
-    )
-
-    verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
-    run_btn = gr.Button("Analyse", variant="primary", size="lg")
 
     with gr.Tabs():
-        with gr.Tab("Agent log"):
-            log_output = gr.Textbox(
-                label="Live output",
-                lines=25,
-                max_lines=25,
-                interactive=False,
+        # ------------------------------------------------------------------ #
+        # Tab 1 — Scalability QA                                              #
+        # ------------------------------------------------------------------ #
+        with gr.Tab("Scalability QA"):
+            gr.Markdown("# Production Scalability QA Agent")
+            gr.Markdown(
+                "Analyse any codebase for production scalability issues using Claude or GPT-4o. "
+                "Paste a GitHub URL **or** a local folder path."
             )
-        with gr.Tab("Report"):
-            report_output = gr.Markdown(label="Scalability report")
-        with gr.Tab("History"):
-            refresh_btn = gr.Button("Refresh", size="sm")
-            history_df = gr.Dataframe(
-                headers=["ID", "Source", "Date", "Duration", "Critical", "High", "Medium", "Low"],
-                interactive=False,
-                wrap=True,
-            )
-            gr.Markdown("### Load a past report")
+
             with gr.Row():
-                id_input = gr.Number(label="Report ID", precision=0, scale=1)
-                load_btn = gr.Button("Load", scale=1)
-            past_report = gr.Markdown()
+                github_input = gr.Textbox(
+                    label="GitHub repo URL",
+                    placeholder="https://github.com/owner/repo",
+                    scale=3,
+                )
+                model_dropdown = gr.Dropdown(
+                    label="Model",
+                    choices=_ALL_MODELS,
+                    value=_DEFAULT_MODEL,
+                    scale=2,
+                )
 
-    # Swap key field visibility when the model changes
-    model_dropdown.change(
-        fn=_update_key_visibility,
-        inputs=model_dropdown,
-        outputs=[api_key_input, openai_key_input],
-    )
+            with gr.Row():
+                api_key_input = gr.Textbox(
+                    label="Anthropic API key",
+                    placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
+                    type="password",
+                    scale=2,
+                    visible=True,
+                )
+                openai_key_input = gr.Textbox(
+                    label="OpenAI API key",
+                    placeholder="sk-…  (or set OPENAI_API_KEY env var)",
+                    type="password",
+                    scale=2,
+                    visible=False,
+                )
+                gh_token_input = gr.Textbox(
+                    label="GitHub token (optional — required for private repos)",
+                    placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
+                    type="password",
+                    scale=2,
+                )
 
-    run_btn.click(
-        fn=run_analysis,
-        inputs=[
-            github_input, local_input, model_dropdown,
-            api_key_input, openai_key_input,
-            gh_token_input, verbose_cb, session_state,
-        ],
-        outputs=[log_output, report_output],
-    )
+            local_input = gr.Textbox(
+                label="— or — local path",
+                placeholder="/path/to/your/project  (leave blank if using GitHub URL above)",
+            )
+
+            verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
+            run_btn = gr.Button("Analyse", variant="primary", size="lg")
+
+            with gr.Tabs():
+                with gr.Tab("Agent log"):
+                    log_output = gr.Textbox(
+                        label="Live output",
+                        lines=25,
+                        max_lines=25,
+                        interactive=False,
+                    )
+                with gr.Tab("Report"):
+                    report_output = gr.Markdown(label="Scalability report")
+                with gr.Tab("History"):
+                    refresh_btn = gr.Button("Refresh", size="sm")
+                    history_df = gr.Dataframe(
+                        headers=["ID", "Source", "Date", "Duration", "Critical", "High", "Medium", "Low"],
+                        interactive=False,
+                        wrap=True,
+                    )
+                    gr.Markdown("### Load a past report")
+                    with gr.Row():
+                        id_input = gr.Number(label="Report ID", precision=0, scale=1)
+                        load_btn = gr.Button("Load", scale=1)
+                    past_report = gr.Markdown()
+
+            model_dropdown.change(
+                fn=_update_key_visibility,
+                inputs=model_dropdown,
+                outputs=[api_key_input, openai_key_input],
+            )
+
+            run_btn.click(
+                fn=run_analysis,
+                inputs=[
+                    github_input, local_input, model_dropdown,
+                    api_key_input, openai_key_input,
+                    gh_token_input, verbose_cb, session_state,
+                ],
+                outputs=[log_output, report_output],
+            )
+
+            refresh_btn.click(fn=load_history, inputs=session_state, outputs=history_df)
+            load_btn.click(fn=load_report, inputs=[id_input, session_state], outputs=past_report)
+
+        # ------------------------------------------------------------------ #
+        # Tab 2 — SaaS Discovery                                              #
+        # ------------------------------------------------------------------ #
+        with gr.Tab("SaaS Discovery"):
+            gr.Markdown("# SaaS Framework Discovery Agent")
+            gr.Markdown(
+                "Find the most popular open-source GitHub projects that can be packaged as "
+                "SaaS products and shipped quickly on **[Whop](https://whop.com)**. "
+                "Select categories below — Claude will search GitHub, evaluate licences, "
+                "read READMEs, and produce a ranked report with Whop shipping playbooks."
+            )
+
+            with gr.Row():
+                saas_model_dropdown = gr.Dropdown(
+                    label="Model",
+                    choices=_ANTHROPIC_MODELS,
+                    value=_DEFAULT_MODEL,
+                    scale=2,
+                )
+                saas_gh_token_input = gr.Textbox(
+                    label="GitHub token (recommended — raises rate limit to 5 000 req/hour)",
+                    placeholder="ghp_…  (or set GITHUB_TOKEN env var)",
+                    type="password",
+                    scale=2,
+                )
+                saas_api_key_input = gr.Textbox(
+                    label="Anthropic API key",
+                    placeholder="sk-ant-…  (or set ANTHROPIC_API_KEY env var)",
+                    type="password",
+                    scale=2,
+                )
+
+            saas_categories = gr.CheckboxGroup(
+                label="Categories to search",
+                choices=_SAAS_CATEGORY_CHOICES,
+                value=["AI & LLM Tools", "Developer Tools"],
+            )
+
+            saas_custom_query = gr.Textbox(
+                label="Custom GitHub search query (optional)",
+                placeholder="topic:crm stars:>500 language:python",
+            )
+
+            saas_verbose_cb = gr.Checkbox(label="Verbose — show model reasoning", value=False)
+            saas_run_btn = gr.Button("Discover SaaS Frameworks", variant="primary", size="lg")
+
+            with gr.Tabs():
+                with gr.Tab("Agent log"):
+                    saas_log_output = gr.Textbox(
+                        label="Live output",
+                        lines=25,
+                        max_lines=25,
+                        interactive=False,
+                    )
+                with gr.Tab("Report"):
+                    saas_report_output = gr.Markdown(label="SaaS discovery report")
+
+            saas_run_btn.click(
+                fn=run_saas_discovery,
+                inputs=[
+                    saas_categories,
+                    saas_custom_query,
+                    saas_model_dropdown,
+                    saas_api_key_input,
+                    saas_gh_token_input,
+                    saas_verbose_cb,
+                ],
+                outputs=[saas_log_output, saas_report_output],
+            )
+
     def _on_load() -> tuple[str, list]:
         sid = str(uuid.uuid4())
         return sid, load_history(sid)
 
-    refresh_btn.click(fn=load_history, inputs=session_state, outputs=history_df)
-    load_btn.click(fn=load_report, inputs=[id_input, session_state], outputs=past_report)
     demo.load(fn=_on_load, inputs=None, outputs=[session_state, history_df])
 
 if __name__ == "__main__":
