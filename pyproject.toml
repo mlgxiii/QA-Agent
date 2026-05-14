@@ -1,20 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools>=70"]
+build-backend = "setuptools.backends.legacy:build"
 
 [project]
-name = "qa-agent"
+name = "saas-discovery-agent"
 version = "0.1.0"
-description = "Production Scalability QA Agent powered by Claude"
-readme = "README.md"
-requires-python = ">=3.10"
+description = "AI agent that discovers popular open-source GitHub frameworks for SaaS packaging on Whop"
+requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.52.0",
+    "gradio>=4.0.0",
 ]
 
 [project.scripts]
-qa-agent = "qa_agent.cli:main"
+saas-discovery = "saas_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["qa_agent*"]
+include = ["saas_agent*"]
